@@ -22,6 +22,8 @@ from providers.pgsgrove import PGSGroveProvider
 from providers.elevenlabs import ElevenLabsProvider
 from providers.zai import ZaiProvider
 from providers.ollama_cloud import OllamaCloudProvider
+from providers.nanogpt import NanoGPTProvider
+from providers.perplexity import PerplexityProvider
 
 # Cloud Providers
 from providers.railway import RailwayProvider
@@ -224,6 +226,32 @@ AI_PROVIDERS = {
         "refresh_interval": 1800,
         "note": "Quota-based (not USD) — shows weekly quota usage as a percentage.",
     },
+    "nanogpt": {
+        "class": NanoGPTProvider,
+        "name": "NanoGPT",
+        "category": "ai",
+        "auth_type": "api_key",
+        "auth_fields": [
+            {"key": "api_key", "label": "API Key", "placeholder": "sk-nano-...", "secret": True},
+        ],
+        "auth_help": "Generate an API key at nano-gpt.com → Settings → API Keys",
+        "tier": 1,
+        "refresh_interval": 600,
+        "note": "Prepaid wallet balance (USD or Nano); pay-per-use, no fixed credit pool.",
+    },
+    "perplexity": {
+        "class": PerplexityProvider,
+        "name": "Perplexity",
+        "category": "ai",
+        "auth_type": "api_key",
+        "auth_fields": [
+            {"key": "api_key", "label": "API Key", "placeholder": "pplx-...", "secret": True},
+        ],
+        "auth_help": "Generate an API key at console.perplexity.ai/settings/api",
+        "tier": 1,
+        "refresh_interval": 600,
+        "note": "No balance endpoint — shows key validity only. Check credit balance in the console.",
+    },
 }
 
 # ─── Cloud Provider Registry
@@ -358,6 +386,8 @@ __all__ = [
     "ElevenLabsProvider",
     "ZaiProvider",
     "OllamaCloudProvider",
+    "NanoGPTProvider",
+    "PerplexityProvider",
     # Cloud
     "RailwayProvider",
     "VercelProvider",
