@@ -18,6 +18,10 @@ from providers.warp import WarpProvider
 from providers.plaud import PlaudProvider
 from providers.gemini import GeminiProvider
 from providers.civitai import CivitAIProvider
+from providers.pgsgrove import PGSGroveProvider
+from providers.elevenlabs import ElevenLabsProvider
+from providers.zai import ZaiProvider
+from providers.ollama_cloud import OllamaCloudProvider
 
 # Cloud Providers
 from providers.railway import RailwayProvider
@@ -168,6 +172,58 @@ AI_PROVIDERS = {
         "tier": 2,
         "refresh_interval": 1800,
     },
+    "pgsgrove": {
+        "class": PGSGroveProvider,
+        "name": "PGSGrove",
+        "category": "ai",
+        "auth_type": "api_key",
+        "auth_fields": [
+            {"key": "api_key", "label": "API Key", "placeholder": "pgsk_...", "secret": True},
+        ],
+        "auth_help": "Get your key from your Phoenix Grove account (api.pgsgrove.com)",
+        "tier": 1,
+        "refresh_interval": 1800,
+        "note": "Flat 'banked full-speed time' plan — shows % of the weekly allowance remaining.",
+    },
+    "elevenlabs": {
+        "class": ElevenLabsProvider,
+        "name": "ElevenLabs",
+        "category": "ai",
+        "auth_type": "api_key",
+        "auth_fields": [
+            {"key": "api_key", "label": "API Key", "placeholder": "sk_...", "secret": True},
+        ],
+        "auth_help": "Get your API key from elevenlabs.io → Profile → API Keys",
+        "tier": 1,
+        "refresh_interval": 1800,
+        "note": "Shows TTS character credits remaining this billing period.",
+    },
+    "zai": {
+        "class": ZaiProvider,
+        "name": "z.ai",
+        "category": "ai",
+        "auth_type": "api_key",
+        "auth_fields": [
+            {"key": "api_key", "label": "API Key", "placeholder": "Paste key", "secret": True},
+        ],
+        "auth_help": "Get your GLM Coding Plan API key from z.ai → API Keys",
+        "tier": 1,
+        "refresh_interval": 1800,
+        "note": "No balance endpoint — GLM Coding Plan quota is dashboard-only. Shows key validity.",
+    },
+    "ollama_cloud": {
+        "class": OllamaCloudProvider,
+        "name": "Ollama Cloud",
+        "category": "ai",
+        "auth_type": "api_key",
+        "auth_fields": [
+            {"key": "api_key", "label": "Usage API Key", "placeholder": "Paste key", "secret": True},
+        ],
+        "auth_help": "Generate a usage-reporting API key at ollama.com/settings → API keys",
+        "tier": 1,
+        "refresh_interval": 1800,
+        "note": "Quota-based (not USD) — shows weekly quota usage as a percentage.",
+    },
 }
 
 # ─── Cloud Provider Registry
@@ -298,6 +354,10 @@ __all__ = [
     "PlaudProvider",
     "GeminiProvider",
     "CivitAIProvider",
+    "PGSGroveProvider",
+    "ElevenLabsProvider",
+    "ZaiProvider",
+    "OllamaCloudProvider",
     # Cloud
     "RailwayProvider",
     "VercelProvider",

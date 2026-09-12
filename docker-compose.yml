@@ -1,0 +1,28 @@
+# Reckoner — fleet deploy (HAL). Two services on one origin:
+#   web (nginx)  — serves the built SPA + reverse-proxies /api → backend
+#   backend      — FastAPI/uvicorn, SQLite persisted in a named volume
+# Browse at http://<host>:8787 . Credentials come from reckoner.env.
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: [reckoner.env]
+    volumes:
+      - reckoner-data:/app/data
+    restart: unless-stopped
+    expose:
+      - "8000"
+
+  web:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    ports:
+      - "8787:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  reckoner-data:
