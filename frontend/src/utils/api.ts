@@ -10,6 +10,7 @@ import type {
   RefreshResponse,
   BalanceSnapshot,
   HealthResponse,
+  QuotaResponse,
 } from '../types';
 
 // In production (split deployment), VITE_API_URL points to the backend Railway service.
@@ -112,6 +113,9 @@ export const api = {
     request<{ message: string }>(`/settings/providers/${providerId}/credentials`, {
       method: 'DELETE',
     }),
+
+  /** Plan usage for every vendor */
+  getQuota: () => request<QuotaResponse>('/quota'),
 
   /** Health check */
   health: () => request<HealthResponse>('/health'),

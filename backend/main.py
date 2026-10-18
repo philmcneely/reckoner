@@ -17,6 +17,8 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from auth import auth_enabled, require_auth, require_auth_if_protected
 from routers import auth, credits, settings, health
 from models.database import init_db
+from quota import router as quota_router
+from quota.store import init_quota_tables
 from scheduler import start_scheduler, stop_scheduler
 
 logging.basicConfig(
@@ -31,6 +33,7 @@ async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown events."""
     logger.info("Starting Reckoner API...")
     await init_db()
+    await init_quota_tables()
     start_scheduler()
     yield
     logger.info("Shutting down Reckoner API...")
@@ -129,6 +132,9 @@ app.include_router(
     tags=["settings"],
     dependencies=[Depends(require_auth)],
 )
+# Plan usage / quota (auth is per route: a read token for Switchboard, an ingest token for the
+# client collectors, the dashboard login for people).
+app.include_router(quota_router.router, prefix="/api/quota", tags=["quota"])
 
 
 @app.get("/", include_in_schema=False)

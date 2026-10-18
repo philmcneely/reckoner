@@ -127,6 +127,43 @@ When `RECKONER_PASSWORD` is not set, auth is completely disabled and the dashboa
 
 Tokens are issued as JWTs with a 30-day expiry and are invalidated on backend redeploy.
 
+### Plan usage (quota windows)
+
+The **Plan usage** panel shows, for every metered vendor, each window's used % and reset time,
+the plan, and where the number came from. It is the one place the fleet checks vendor quota:
+Switchboard polls `GET /api/quota` and hands each proxy only the vendors in its own chains.
+
+| Vendor | Source | How |
+|--------|--------|-----|
+| Z.ai GLM Coding Plan | vendor API | `api.z.ai/api/monitor/usage/quota/limit` (`ZAI_API_KEY`) |
+| OpenCode Go | vendor API | `opencode.ai/zen/go/v1/usage` (`OPENCODE_GO_API_KEY`) |
+| NanoGPT | vendor API | `nano-gpt.com/api/subscription/v1/usage` (`NANOGPT_API_KEY`) — the source opencode's quota sidebar uses |
+| pgsgrove | vendor API | `api.pgsgrove.com/v1/usage` (`PGSGROVE_API_KEY`) |
+| Ollama Cloud | vendor API | `ollama.com/api/usage` (`OLLAMA_CLOUD_API_KEY`) — request counts only |
+| Mistral, Gemini API | our logs | neither publishes plan usage; Switchboard's `/api/backend-usage` (7-day calls and tokens) |
+| Claude Max, Cursor, Copilot | client | herdr's usage reader (`collectors/client_usage_collector.py`) |
+| Antigravity | client | `antigravity-usage quota --json` |
+| Cline | client | `statusline-cline --quota --json` |
+| Muse | client | Muse CLI `usage/read` (one tiny turn per hour — Muse only knows its usage after a call) |
+| opencode (all providers) | client | `opencode stats --days 7 --models --cost --json` |
+
+Each server-side vendor is read on its own interval (3–15 minutes), never faster. A failed read
+keeps the last good numbers and shows the error. A reading older than its expected refresh is
+marked stale.
+
+| Variable | Purpose |
+|----------|---------|
+| `RECKONER_QUOTA_TOKEN` | Bearer token for reading `/api/quota` without a login (Switchboard) |
+| `RECKONER_INGEST_TOKEN` | Bearer token for collectors posting to `/api/quota/ingest`. Unset → ingest is off (503) |
+| `RECKONER_INGEST_IDS` | Vendor ids a collector may write (default `claude_max,cursor,copilot,antigravity,cline,muse,opencode_cli`) |
+| `RECKONER_DB_PATH` | SQLite file. In Docker set `/app/data/tracker.db` so it lives in the volume |
+| `SWITCHBOARD_URL` | Switchboard base URL for the our-logs vendors (unset → those two cards say so) |
+
+The client collector runs on the workstation where those clients are signed in, every 5 minutes
+from launchd (`collectors/com.reckoner.usage-collector.plist`, a template: replace `__HOME__`).
+It reads `RECKONER_INGEST_URL`, `RECKONER_INGEST_TOKEN` and optionally `RECKONER_COLLECTOR_HOST`
+from `~/.config/reckoner/collector.env` (mode 600). No account names, emails or tokens are sent.
+
 ### In-App Settings
 
 Click the ⚙️ icon on any provider card to configure credentials directly in the dashboard. Settings are persisted in the local SQLite database.
@@ -279,6 +316,10 @@ reckoner/
 | `GET /api/credits/` | GET | Full dashboard (cached) | Protected* |
 | `POST /api/credits/refresh` | POST | Refresh all providers | Protected* |
 | `POST /api/credits/refresh/{id}` | POST | Refresh single provider | Protected* |
+| `GET /api/quota` | GET | Plan usage for every vendor (windows, %, reset, source) | `RECKONER_QUOTA_TOKEN` or login |
+| `GET /api/quota/history/{vendor}` | GET | Last 30 days of readings for one vendor | `RECKONER_QUOTA_TOKEN` or login |
+| `POST /api/quota/refresh` | POST | Re-read every server-side vendor now | Login |
+| `POST /api/quota/ingest` | POST | A collector pushes readings from a client it asked | `RECKONER_INGEST_TOKEN` |
 | `GET /api/credits/providers` | GET | List providers with metadata | Protected* |
 | `GET /api/settings/providers` | GET | Get settings (masked) | Auth required |
 | `PUT /api/settings/providers/{id}` | PUT | Update provider credentials | Auth required |

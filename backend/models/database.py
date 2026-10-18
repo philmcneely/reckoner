@@ -5,11 +5,15 @@ Stores provider configurations and cached balance snapshots.
 
 import aiosqlite
 import logging
+import os
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(__file__).parent.parent / "data" / "tracker.db"
+# RECKONER_DB_PATH: the fleet compose sets /app/data/tracker.db, the named volume. The old
+# default (backend/data/tracker.db) sat in the container's writable layer, so every image
+# rebuild silently started an empty database (found 2026-10-18: 615 MB of history at risk).
+DB_PATH = Path(os.environ.get("RECKONER_DB_PATH") or (Path(__file__).parent.parent / "data" / "tracker.db"))
 
 
 def get_db():

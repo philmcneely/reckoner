@@ -17,6 +17,7 @@ import { useSettings } from './hooks/useSettings';
 import { SummaryBar } from './components/SummaryBar';
 import { Footer } from './components/Footer';
 import { ProviderCard } from './components/ProviderCard';
+import { PlanUsagePanel } from './components/PlanUsagePanel';
 import { LoginPage } from './pages/LoginPage';
 import { SettingsPage } from './pages/SettingsPage';
 import type { BalanceSnapshot } from './types';
@@ -132,6 +133,9 @@ export default function App() {
         {/* Provider sections */}
         {data && (
           <div className="space-y-10">
+
+            {/* ── Plan usage (quota windows per vendor) ── */}
+            <PlanUsagePanel />
 
             {/* ── AI Providers ── */}
             {aiProviders.length > 0 && (

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Client usage collector: every 5 minutes, ask the clients on this Mac that know their own plan usage
+  (herdr, Antigravity CLI, statusline-cline, Muse CLI, opencode) and push it to Reckoner.
+  Install (template: __HOME__ becomes your home directory):
+    install -m 755 client_usage_collector.py ~/.local/bin/reckoner-usage-collector
+    sed "s#__HOME__#$HOME#g" com.reckoner.usage-collector.plist > ~/Library/LaunchAgents/com.reckoner.usage-collector.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.reckoner.usage-collector.plist
+  Settings: RECKONER_INGEST_URL / RECKONER_INGEST_TOKEN in ~/.config/reckoner/collector.env (mode 600),
+  never in this file. Log: ~/Library/Logs/reckoner-usage-collector.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.reckoner.usage-collector</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/python3</string>
+    <string>__HOME__/.local/bin/reckoner-usage-collector</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- the clients are node/bash scripts: launchd's default PATH has no /usr/local/bin -->
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:__HOME__/.local/bin:__HOME__/.bun/bin</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+  </dict>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/reckoner-usage-collector.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/reckoner-usage-collector.log</string>
+</dict>
+</plist>

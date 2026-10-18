@@ -8,6 +8,9 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     env_file: [reckoner.env]
+    environment:
+      # the SQLite file must live in the volume; the default path is in the image's writable layer
+      RECKONER_DB_PATH: /app/data/tracker.db
     volumes:
       - reckoner-data:/app/data
     restart: unless-stopped

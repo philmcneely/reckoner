@@ -78,3 +78,36 @@ export interface AuthStatus {
   dashboard_protected: boolean;
   authenticated: boolean;
 }
+
+// ── Plan usage / quota ───────────────────────────────────────────────────────
+
+export interface QuotaWindow {
+  name: string;
+  used_pct: number | null;
+  resets_at?: string | null;
+  starts_at?: string | null;
+  used?: number | null;
+  limit?: number | null;
+  unit?: string | null;
+}
+
+export interface QuotaReading {
+  id: string;
+  name: string;
+  source: string;
+  source_kind: 'api' | 'client' | 'our_logs';
+  plan: string | null;
+  ok: boolean;
+  error: string | null;
+  fetched_at: string | null;
+  windows: QuotaWindow[];
+  money: Record<string, number>;
+  extra: Record<string, unknown>;
+  notes: string | null;
+  stale: boolean;
+  last_good?: { windows: QuotaWindow[]; fetched_at: string | null } | null;
+}
+
+export interface QuotaResponse {
+  vendors: QuotaReading[];
+}

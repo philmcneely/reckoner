@@ -71,8 +71,9 @@ class ZaiProvider(BaseProvider):
                 status="ok",
                 raw_data={
                     "note": (
-                        "No balance/usage endpoint — the GLM Coding Plan does not "
-                        "expose quota via API (only via the bigmodel.cn dashboard). "
+                        "No balance endpoint (flat plan). Plan usage (5-hour / weekly "
+                        "quota) is read from /api/monitor/usage/quota/limit and shown "
+                        "under Plan usage. "
                         "Key validated via model list."
                     ),
                     "key_valid": True,
