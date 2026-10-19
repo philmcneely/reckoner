@@ -42,6 +42,7 @@ regular inference key).
 
 import logging
 import math
+import re
 
 import httpx
 
@@ -51,7 +52,7 @@ from providers.base import BaseProvider
 logger = logging.getLogger(__name__)
 
 USAGE_ENDPOINT = "https://ollama.com/api/usage"
-_RANGES = {"day", "week", "month"}
+_RANGE_RE = re.compile(r"^(\d{1,3}[hdwm]|day|week|month)$")  # Ollama sends "7d"
 
 
 class OllamaCloudProvider(BaseProvider):
@@ -105,7 +106,7 @@ class OllamaCloudProvider(BaseProvider):
                 currency     = "requests",
                 raw_data     = {
                     "request_count": int(count),
-                    "range":         rng if rng in _RANGES else None,
+                    "range":         rng if isinstance(rng, str) and _RANGE_RE.fullmatch(rng) else None,
                     "note":          "Ollama's usage API reports request counts only (since 2026-10-17); "
                                      "no plan limits are published.",
                 },

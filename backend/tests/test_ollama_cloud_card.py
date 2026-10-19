@@ -78,6 +78,8 @@ def test_range_is_only_kept_when_known():
     assert s.status == "ok" and s.raw_data["range"] is None
     s = fetch(lambda req: httpx.Response(200, json=dict(COUNTS, range="day")))
     assert s.raw_data["range"] == "day"
+    s = fetch(lambda req: httpx.Response(200, json=dict(COUNTS, range="7d")))  # what Ollama sends (2026-10-19)
+    assert s.raw_data["range"] == "7d"
 
 
 def test_bad_limit_fraction_is_an_error_not_an_exception():
