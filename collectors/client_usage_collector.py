@@ -35,6 +35,7 @@ never stops the others. stdlib only (runs under /usr/local/bin/python3 from laun
 import glob
 import json
 import os
+import re
 import select
 import socket
 import subprocess
@@ -88,6 +89,21 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
+_AT_RE = re.compile(r"\S*@\S*")
+_TOKENISH_RE = re.compile(r"[A-Za-z0-9_\-.]{20,}")
+
+
+def _scrub(text, limit=300):
+    """Error text from a CLI we don't control, made safe to store: anything with an "@" (an email or
+    account) and any token-like run of 20+ [A-Za-z0-9_-.] is masked, control characters dropped,
+    length bounded. None for empty."""
+    if not text:
+        return None
+    out = _TOKENISH_RE.sub("[redacted]", _AT_RE.sub("[redacted]", str(text)))
+    out = "".join(c for c in out if c.isprintable())
+    return out[:limit] or None
+
+
 def _run_json(argv, timeout=60):
     out = subprocess.run(argv, capture_output=True, timeout=timeout, check=False)
     if out.returncode != 0 and not out.stdout:
@@ -112,7 +128,7 @@ def from_herdr_usage(doc):
             windows.append({"name": label[:48], "used_pct": w.get("used_percent"),
                             "resets_at": w.get("resets_at"), "starts_at": w.get("starts_at")})
         r = {"id": vid, "name": name, "source": f"herdr on {HOST}", "source_kind": "client", "plan": p.get("plan"),
-             "ok": not p.get("problem"), "error": (str(p["problem"])[:300] if p.get("problem") else None),
+             "ok": not p.get("problem"), "error": _scrub(p.get("problem")),
              "fetched_at": p.get("checked_at") or _now(), "windows": windows, "stale_after_s": 1800}
         readings.append(r)
     return readings
@@ -177,7 +193,7 @@ def from_cline(doc):
     err = doc.get("error") if isinstance(doc, dict) else None
     return {"id": "cline", "name": "Cline (ClinePass)", "source": f"Cline account API via statusline-cline on {HOST}",
             "source_kind": "client", "plan": q.get("planName"), "ok": bool(windows),
-            "error": (f"refresh failing: {err}"[:300] if err else None),
+            "error": (_scrub(f"refresh failing: {err}") if err else None),
             # the time the numbers were actually read from Cline, not now: a stuck cache shows stale
             "fetched_at": q.get("fetchedAt") or _now(), "windows": windows, "stale_after_s": 1800,
             "extra": {"period_end": q.get("periodEnd")}}

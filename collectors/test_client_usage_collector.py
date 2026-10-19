@@ -142,3 +142,38 @@ def test_a_failing_reader_does_not_stop_the_others(monkeypatch):
     monkeypatch.setattr(C, "read_opencode_stats", lambda: None)
     readings, errors = C.collect()
     assert [r["id"] for r in readings] == ["antigravity"] and "herdr" in errors[0]
+
+
+# ── error text from CLIs we don't control is scrubbed before it is sent ─────
+# herdr "problem" and cline "error" can carry an account name, an email or a token.
+
+LEAKY = ("auth failed for someone@example.com (acct:me@corp): bearer "
+         "sk-ant-api03_AbCdEf0123456789xyz.QwErTy rejected")
+
+
+def test_scrub_masks_emails_and_token_like_strings():
+    out = C._scrub(LEAKY)
+    assert "@" not in out
+    assert "someone" not in out and "corp" not in out
+    assert "sk-ant-api03_AbCdEf0123456789xyz.QwErTy" not in out and "AbCdEf0123456789" not in out
+    assert out.startswith("auth failed for ") and "rejected" in out
+
+
+def test_scrub_keeps_short_plain_text_and_bounds_length():
+    assert C._scrub("token expired") == "token expired"
+    assert C._scrub("HTTP 401: unauthorized.") == "HTTP 401: unauthorized."
+    assert len(C._scrub("x " * 1000)) <= 300
+    assert C._scrub(None) is None and C._scrub("") is None
+    assert "\x1b" not in C._scrub("bad\x1b[31m colour")
+
+
+def test_herdr_problem_is_scrubbed():
+    doc = {"providers": [{"id": "cursor", "plan": "free", "problem": LEAKY, "windows": []}]}
+    err = C.from_herdr_usage(doc)[0]["error"]
+    assert "@" not in err and "AbCdEf0123456789" not in err and err.startswith("auth failed")
+
+
+def test_cline_error_is_scrubbed():
+    err = C.from_cline({"error": LEAKY, "quota": {}})["error"]
+    assert err.startswith("refresh failing: auth failed")
+    assert "@" not in err and "AbCdEf0123456789" not in err
