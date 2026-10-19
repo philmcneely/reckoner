@@ -64,3 +64,24 @@ def test_quota_reader_refreshes_well_inside_the_proxy_staleness_limit():
     # a 15-minute read interval left the gate open part of every cycle should limits come back.
     from quota.readers import SERVER_READERS
     assert SERVER_READERS["ollama_cloud"][2] <= 300
+
+
+def test_non_finite_or_negative_count_is_an_error_not_an_exception():
+    for bad in ('NaN', 'Infinity', '-5'):
+        body = '{"range": "week", "totals": {"request_count": %s}}' % bad
+        s = fetch(lambda req, b=body: httpx.Response(200, content=b.encode(), headers={"content-type": "application/json"}))
+        assert s.status == "error", bad
+
+
+def test_range_is_only_kept_when_known():
+    s = fetch(lambda req: httpx.Response(200, json=dict(COUNTS, range="<script>" + "x" * 5000)))
+    assert s.status == "ok" and s.raw_data["range"] is None
+    s = fetch(lambda req: httpx.Response(200, json=dict(COUNTS, range="day")))
+    assert s.raw_data["range"] == "day"
+
+
+def test_bad_limit_fraction_is_an_error_not_an_exception():
+    for bad in ('"lots"', 'NaN', '{"x": 1}'):
+        body = '{"limits": {"weekly": {"usage": %s}}}' % bad
+        s = fetch(lambda req, b=body: httpx.Response(200, content=b.encode(), headers={"content-type": "application/json"}))
+        assert s.status == "error", bad

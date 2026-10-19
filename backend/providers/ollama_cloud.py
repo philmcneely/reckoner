@@ -29,10 +29,7 @@ Endpoint:
       }
 
   `limits.weekly.usage` / `limits.session.usage` are fractions (0-1) of the
-  respective quota already consumed — not USD amounts. This mirrors the
-  fields the fleet's llm-proxy already polls (see
-  _refresh_ollama_usage_cache() / _get_ollama_weekly_usage() in
-  llm-proxy.py) to gate routing once a quota nears exhaustion.
+  respective quota already consumed — not USD amounts.
 
 This provider surfaces the WEEKLY quota as the headline number (the
 longer-lived, more meaningful budget) and includes session-level detail
@@ -44,6 +41,8 @@ regular inference key).
 """
 
 import logging
+import math
+
 import httpx
 
 from models.schemas import BalanceSnapshot
@@ -52,6 +51,7 @@ from providers.base import BaseProvider
 logger = logging.getLogger(__name__)
 
 USAGE_ENDPOINT = "https://ollama.com/api/usage"
+_RANGES = {"day", "week", "month"}
 
 
 class OllamaCloudProvider(BaseProvider):
@@ -96,25 +96,32 @@ class OllamaCloudProvider(BaseProvider):
         if weekly_usage_frac is None:
             totals = data.get("totals") if isinstance(data.get("totals"), dict) else {}
             count = totals.get("request_count")
-            if isinstance(count, bool) or not isinstance(count, (int, float)):
+            if (isinstance(count, bool) or not isinstance(count, (int, float))
+                    or not math.isfinite(count) or count < 0):
                 return self._error_snapshot("Ollama usage response has neither limits nor request counts")
+            rng = data.get("range")
             return self._make_snapshot(
                 used_credits = float(count),
                 currency     = "requests",
                 raw_data     = {
                     "request_count": int(count),
-                    "range":         data.get("range"),
+                    "range":         rng if rng in _RANGES else None,
                     "note":          "Ollama's usage API reports request counts only (since 2026-10-17); "
                                      "no plan limits are published.",
                 },
             )
 
+        if (isinstance(weekly_usage_frac, bool) or not isinstance(weekly_usage_frac, (int, float))
+                or not math.isfinite(weekly_usage_frac)):
+            return self._error_snapshot("Ollama usage response has a non-numeric limits.weekly.usage")
         weekly_used_pct      = round(float(weekly_usage_frac) * 100, 2)
         weekly_remaining_pct = round(100.0 - weekly_used_pct, 2)
 
         session_usage_frac = session.get("usage")
         session_used_pct = (
-            round(float(session_usage_frac) * 100, 2) if session_usage_frac is not None else None
+            round(float(session_usage_frac) * 100, 2)
+            if isinstance(session_usage_frac, (int, float)) and not isinstance(session_usage_frac, bool)
+            and math.isfinite(session_usage_frac) else None
         )
 
         raw: dict = {
