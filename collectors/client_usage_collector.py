@@ -99,7 +99,10 @@ def _scrub(text, limit=300):
     length bounded. None for empty."""
     if not text:
         return None
-    out = _TOKENISH_RE.sub("[redacted]", _AT_RE.sub("[redacted]", str(text)))
+    # Cut well past `limit` first: the "@" pattern is quadratic on one huge run with no "@", and
+    # nothing beyond the cut can reach the output anyway.
+    out = str(text)[:limit * 4]
+    out = _TOKENISH_RE.sub("[redacted]", _AT_RE.sub("[redacted]", out))
     out = "".join(c for c in out if c.isprintable())
     return out[:limit] or None
 

@@ -177,3 +177,9 @@ def test_cline_error_is_scrubbed():
     err = C.from_cline({"error": LEAKY, "quota": {}})["error"]
     assert err.startswith("refresh failing: auth failed")
     assert "@" not in err and "AbCdEf0123456789" not in err
+
+
+def test_scrub_is_fast_on_huge_input():
+    t0 = time.time()
+    out = C._scrub("a" * 500_000 + " x@y")
+    assert time.time() - t0 < 0.5 and len(out) <= 300
