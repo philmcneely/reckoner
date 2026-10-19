@@ -196,24 +196,160 @@ def test_ollama_new_format_and_429():
     assert not limited.ok and "429" in limited.error
 
 
-def test_our_logs_readers_are_labelled(monkeypatch):
+def test_gemini_our_logs_reader_is_labelled(monkeypatch):
     monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
 
     def h(req):
-        assert "backend=mistral" in str(req.url) or "backend=ai_studio" in str(req.url)
+        assert "backend=ai_studio" in str(req.url)
         return httpx.Response(200, json={"calls": 7, "ok": 6, "input_tokens": 1000, "output_tokens": 50,
                                          "cache_read_tokens": 0, "last_ts": "2026-10-18T20:00:00", "by_machine": {"box-a": 7}})
-    m = run(readers.read_mistral(client_for(h)))
-    assert m.source_kind == "our_logs" and m.ok and m.windows == []
-    assert "per-minute" in m.notes and m.extra["calls_7d"] == 7
     g = run(readers.read_gemini_api(client_for(h)))
-    assert g.source_kind == "our_logs" and "no usage api" in g.notes.lower()
+    assert g.source_kind == "our_logs" and g.ok and g.windows == []
+    assert "no usage api" in g.notes.lower() and g.extra["calls_7d"] == 7
 
 
 def test_our_logs_without_switchboard_url_says_so(monkeypatch):
     monkeypatch.delenv("SWITCHBOARD_URL", raising=False)
-    m = run(readers.read_mistral(client_for(lambda req: httpx.Response(500))))
+    m = run(readers.read_gemini_api(client_for(lambda req: httpx.Response(500))))
     assert not m.ok and "SWITCHBOARD_URL" in m.error and m.source_kind == "our_logs"
+
+
+# ── Mistral: a monthly dollar window ─────────────────────────────────────────
+# The education key has $15 of API usage a month, resetting on the 1st; pay-as-you-go is off, so $15 is a
+# hard stop. Mistral publishes no usage API for it. The reading is the larger of (a) the price-book cost of
+# our proxies' calls this month (Switchboard GET /api/backend-usage) and (b) the latest admin-console reading
+# for the same month, ingested as vendor `mistral_console`, so traffic outside our proxies is not lost.
+
+MNOW = datetime(2026, 10, 19, 22, 44, tzinfo=timezone.utc)
+MONTH_RESET = datetime(2026, 11, 1, tzinfo=timezone.utc)
+
+
+def _usage_handler(seen, **body):
+    base = {"backend": "mistral", "calls": 13, "ok": 13, "input_tokens": 118610, "output_tokens": 159,
+            "cost_usd": 0.0595435, "real_cost_usd": 0.0, "unpriced_calls": 0, "last_ts": "2026-10-18T18:15:12.200640"}
+    base.update(body)
+
+    def h(req):
+        seen["url"] = str(req.url)
+        seen["params"] = dict(req.url.params)
+        return httpx.Response(200, json=base)
+    return h
+
+
+def _console(used=1.18, fetched=datetime(2026, 10, 19, 22, 44, tzinfo=timezone.utc), **over):
+    doc = {"id": "mistral_console", "ok": True, "fetched_at": fetched.isoformat(),
+           "windows": [{"name": "month", "used": used, "limit": 15, "unit": "USD", "resets_at": MONTH_RESET.isoformat()}]}
+    doc.update(over)
+    return doc
+
+
+def _mistral(handler, console=None, now=MNOW, monkeypatch=None):
+    return run(readers.read_mistral(client_for(handler), console=console, now=now))
+
+
+@pytest.fixture
+def sb_env(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    monkeypatch.delenv("MISTRAL_MONTHLY_USD", raising=False)
+
+
+def test_mistral_month_to_date_from_our_logs(sb_env):
+    seen = {}
+    r = _mistral(_usage_handler(seen))
+    assert seen["params"] == {"backend": "mistral", "since": "2026-10-01T00:00:00"}
+    assert r.ok and r.id == "mistral" and r.source_kind == "our_logs"
+    (w,) = r.windows
+    assert w.name == "month" and w.unit == "USD" and w.limit == 15.0 and abs(w.used - 0.0595435) < 1e-9
+    assert abs(w.used_pct - 0.397) < 0.001
+    assert w.resets_at == MONTH_RESET
+    assert r.extra["computed_usd"] == pytest.approx(0.0595435) and r.extra["console_usd"] is None
+    assert r.extra["calls_month"] == 13
+
+
+def test_mistral_console_reading_wins_when_higher(sb_env):
+    r = _mistral(_usage_handler({}), console=_console(1.18))
+    w = r.windows[0]
+    assert w.used == pytest.approx(1.18) and w.used_pct == pytest.approx(7.867, abs=0.001)
+    assert r.extra["computed_usd"] == pytest.approx(0.0595435) and r.extra["console_usd"] == 1.18
+    assert r.extra["console_at"].startswith("2026-10-19T22:44")
+
+
+def test_mistral_computed_wins_when_higher(sb_env):
+    r = _mistral(_usage_handler({}, cost_usd=2.5), console=_console(1.18))
+    assert r.windows[0].used == pytest.approx(2.5) and r.windows[0].used_pct == pytest.approx(16.667, abs=0.001)
+
+
+def test_mistral_console_from_another_month_is_ignored(sb_env):
+    last_month = _console(14.0, fetched=datetime(2026, 9, 30, 20, 0, tzinfo=timezone.utc))
+    r = _mistral(_usage_handler({}), console=last_month)
+    assert r.windows[0].used == pytest.approx(0.0595435) and r.extra["console_usd"] is None
+
+
+def test_mistral_limit_from_env_and_bad_values_fall_back(sb_env, monkeypatch):
+    monkeypatch.setenv("MISTRAL_MONTHLY_USD", "30")
+    assert _mistral(_usage_handler({}), console=_console(3.0)).windows[0].limit == 30.0
+    for bad in ("", "abc", "0", "-5", "nan", "inf"):
+        monkeypatch.setenv("MISTRAL_MONTHLY_USD", bad)
+        assert _mistral(_usage_handler({})).windows[0].limit == 15.0, bad
+
+
+def test_mistral_at_the_hard_stop_reads_100_and_over(sb_env):
+    r = _mistral(_usage_handler({}, cost_usd=15.0))
+    assert r.windows[0].used_pct == pytest.approx(100.0)
+    r = _mistral(_usage_handler({}), console=_console(16.5))
+    assert r.windows[0].used_pct == pytest.approx(110.0)
+
+
+def test_mistral_month_boundaries(sb_env):
+    seen = {}
+    dec = datetime(2026, 12, 31, 23, 59, tzinfo=timezone.utc)
+    r = _mistral(_usage_handler(seen), now=dec)
+    assert seen["params"]["since"] == "2026-12-01T00:00:00"
+    assert r.windows[0].resets_at == datetime(2027, 1, 1, tzinfo=timezone.utc)
+    first = datetime(2026, 11, 1, 0, 0, 5, tzinfo=timezone.utc)
+    assert _mistral(_usage_handler(seen), console=_console(14.9), now=first).windows[0].used == pytest.approx(0.0595435)
+
+
+def test_mistral_switchboard_down_falls_back_to_the_console(sb_env):
+    def down(req):
+        raise httpx.ConnectError("refused")
+    r = _mistral(down, console=_console(1.18))
+    assert r.ok and r.windows[0].used == pytest.approx(1.18)
+    assert r.extra["computed_usd"] is None and "switchboard" in r.extra["switchboard_error"].lower()
+    both = _mistral(down, console=None)
+    assert not both.ok and "Switchboard" in both.error
+
+
+def test_mistral_old_switchboard_without_cost_field(sb_env):
+    def old(req):
+        return httpx.Response(200, json={"backend": "mistral", "calls": 13, "input_tokens": 1})
+    r = _mistral(old, console=_console(1.18))
+    assert r.ok and r.windows[0].used == pytest.approx(1.18) and r.extra["computed_usd"] is None
+    assert not _mistral(old, console=None).ok
+
+
+def test_mistral_unpriced_calls_make_the_cost_a_floor(sb_env):
+    r = _mistral(_usage_handler({}, unpriced_calls=4))
+    assert r.extra["unpriced_calls"] == 4 and "floor" in r.notes.lower()
+
+
+def test_mistral_notes_carry_the_checked_rate_limits_not_the_old_ones(sb_env):
+    r = _mistral(_usage_handler({}))
+    assert len(r.notes) <= 400
+    assert "800,000" in r.notes and "30/min" in r.notes and "16.67" in r.notes
+    assert "500K" not in r.notes and "1,000 requests" not in r.notes
+    assert "hard stop" in r.notes.lower() and r.plan and "15" in r.plan
+
+
+def test_mistral_without_switchboard_url_says_so(monkeypatch):
+    monkeypatch.delenv("SWITCHBOARD_URL", raising=False)
+    m = _mistral(lambda req: httpx.Response(500))
+    assert not m.ok and "SWITCHBOARD_URL" in m.error and m.source_kind == "our_logs"
+
+
+def test_mistral_is_scheduled_every_five_minutes():
+    reader, env, interval = readers.SERVER_READERS["mistral"]
+    assert reader is readers.read_mistral and env is None and interval == 300
 
 
 def test_reader_never_leaks_key_in_error():
@@ -256,6 +392,27 @@ def test_ingest_and_read_back(api):
     v = {x["id"]: x for x in q.json()["vendors"]}
     assert v["claude_max"]["windows"][1]["used_pct"] == 98
     assert v["claude_max"]["source"] == "herdr on ws1"
+
+
+def test_console_reading_can_be_recorded_and_feeds_the_mistral_reading(api, monkeypatch):
+    # How a human records what the Mistral admin console shows: the ingest token, id mistral_console.
+    hdr = {"Authorization": "Bearer " + os.environ["RECKONER_INGEST_TOKEN"]}
+    now = datetime.now(timezone.utc)
+    body = {"source": "console", "readings": [{
+        "id": "mistral_console", "name": "Mistral admin console", "source": "Mistral admin console (entered by hand)",
+        "source_kind": "client", "fetched_at": now.isoformat(),
+        "windows": [{"name": "month", "used": 7.77, "limit": 15, "unit": "USD"}]}]}
+    r = api.post("/api/quota/ingest", json=body, headers=hdr)
+    assert r.status_code == 200, r.text
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    monkeypatch.delenv("MISTRAL_MONTHLY_USD", raising=False)
+    seen = {}
+    reading = run(readers.read_mistral(client_for(_usage_handler(seen))))  # console loaded from the store
+    assert reading.ok and reading.windows[0].used == pytest.approx(7.77)
+    assert reading.extra["console_usd"] == 7.77
+    # the mistral card itself is server-read: a client still cannot overwrite it
+    over = dict(body, readings=[dict(body["readings"][0], id="mistral")])
+    assert api.post("/api/quota/ingest", json=over, headers=hdr).status_code == 422
 
 
 def test_ingest_cannot_overwrite_a_server_read_vendor(api):

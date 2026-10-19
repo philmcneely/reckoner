@@ -25,17 +25,22 @@ Verified 2026-10-18 against the live APIs:
   Ollama      GET https://ollama.com/api/usage                            (Bearer usage key) — since
               2026-10-17 it answers request counts only ({range, totals.request_count, buckets});
               the plan limits are no longer published.
-For the two vendors with no usage or limits API (Mistral's education key reports per-minute rate
-limits only; Google publishes no per-key usage for an AI Studio key), the reading is our own
-proxies' calls from Switchboard GET /api/backend-usage, labelled source_kind="our_logs".
+Google publishes no per-key usage for an AI Studio key, so the Gemini API reading is our own proxies'
+calls from Switchboard GET /api/backend-usage, labelled source_kind="our_logs".
+Mistral's education key has a $15/month allowance (pay-as-you-go off: a hard stop) and no usage API. Its
+reading is one monthly dollar window: the larger of the price-book cost of our proxies' calls this month
+(backend-usage `cost_usd`, since the 1st) and the latest admin-console figure for the same month, which a
+human records as vendor `mistral_console` through /api/quota/ingest (see README).
 """
 
+import math
 import os
 from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
 
+from quota import store
 from quota.models import QuotaReading, QuotaWindow
 
 UA = "reckoner/1.0 (+https://github.com/philmcneely/reckoner)"
@@ -301,11 +306,95 @@ async def _our_logs(client, vid, name, backend, notes) -> QuotaReading:
         return _fail(vid, name, src, "our_logs", e, notes=notes)
 
 
-async def read_mistral(client) -> QuotaReading:
-    return await _our_logs(client, "mistral", "Mistral (education key)", "mistral",
-                           "Mistral publishes no usage or plan-limit API for this key; its responses carry "
-                           "per-minute rate limits only (1,000 requests and 500K tokens a minute, checked "
-                           "2026-10-18). Counts are our own proxies' calls.")
+MISTRAL_DEFAULT_MONTHLY_USD = 15.0
+MISTRAL_CONSOLE_ID = "mistral_console"
+_UNSET = object()
+
+
+def _mistral_monthly_usd() -> float:
+    try:
+        v = float(os.environ.get("MISTRAL_MONTHLY_USD", "").strip())
+    except ValueError:
+        return MISTRAL_DEFAULT_MONTHLY_USD
+    return v if math.isfinite(v) and 0 < v <= 100000 else MISTRAL_DEFAULT_MONTHLY_USD
+
+
+def _month_bounds(now: datetime):
+    """(first instant of this calendar month, first instant of the next), UTC."""
+    start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+    nxt = datetime(now.year + (now.month == 12), now.month % 12 + 1, 1, tzinfo=timezone.utc)
+    return start, nxt
+
+
+def _console_month_usd(doc, start: datetime, reset: datetime):
+    """(used USD, read time) from a mistral_console reading, only when it was read in this calendar month."""
+    if not isinstance(doc, dict) or doc.get("ok") is False:
+        return None, None
+    at = _ts(doc.get("fetched_at"))
+    if at is None or not (start <= at < reset):
+        return None, None
+    for w in doc.get("windows") or []:
+        if isinstance(w, dict) and w.get("name") == "month":
+            used = _num(w.get("used"))
+            if used is None and _num(w.get("used_pct")) is not None and _num(w.get("limit")):
+                used = _num(w.get("used_pct")) / 100.0 * _num(w.get("limit"))
+            if used is not None and 0 <= used < 1e9:
+                return used, at
+    return None, None
+
+
+async def read_mistral(client, console=_UNSET, now: Optional[datetime] = None) -> QuotaReading:
+    """Mistral education key: $15 of API usage a month, resets on the 1st, pay-as-you-go off (a hard stop).
+    Mistral publishes no usage API for it, so the month's spend is the larger of the price-book cost of our
+    proxies' calls (Switchboard) and the latest admin-console reading for this month (mistral_console, entered
+    by hand), which also covers traffic that bypasses our proxies. `console`/`now` are injectable for tests."""
+    vid, name = "mistral", "Mistral (education key)"
+    src = "our proxies' logs (Switchboard) + admin console"
+    plan = "Education: $15/month API allowance"
+    now = now or _now()
+    start, reset = _month_bounds(now)
+    limit = _mistral_monthly_usd()
+    notes = ("Included API usage $15/month, resets on the 1st; pay-as-you-go is off, so it is a hard stop. Spend is the "
+             "larger of our proxies' calls at list price and the last admin-console reading. Rate limits (console, "
+             "2026-10-19): mistral-large-2512 800,000 tokens/min and 0.5 req/s (30/min); mistral-large-4 10M tokens/min, 16.67 req/s.")
+    base = os.environ.get("SWITCHBOARD_URL", "").strip().rstrip("/")
+    computed, calls, unpriced, sb_error = None, None, 0, None
+    try:
+        if not base:
+            raise RuntimeError("SWITCHBOARD_URL is not set")
+        r = await client.get(f"{base}/api/backend-usage", params={"backend": "mistral", "since": start.strftime("%Y-%m-%dT%H:%M:%S")},
+                             headers={"User-Agent": UA, "Accept": "application/json"})
+        if r.status_code != 200:
+            raise RuntimeError(f"Switchboard HTTP {r.status_code}")
+        d = r.json()
+        cost = _num(d.get("cost_usd")) if isinstance(d, dict) else None
+        if cost is None or cost < 0:
+            raise RuntimeError("Switchboard answer has no cost_usd (older build)")
+        computed, calls = cost, d.get("calls")
+        unpriced = int(_num(d.get("unpriced_calls")) or 0)
+    except Exception as e:  # noqa: BLE001
+        sb_error = f"Switchboard usage unavailable: {e}"[:200]
+    if console is _UNSET:
+        try:
+            console = await store.latest_one(MISTRAL_CONSOLE_ID)
+        except Exception:  # noqa: BLE001 — the store being unreadable must not hide the computed number
+            console = None
+    console_usd, console_at = _console_month_usd(console, start, reset)
+    have = [x for x in (computed, console_usd) if x is not None]
+    if not have:
+        return _fail(vid, name, src, "our_logs", sb_error or "no usage figure", notes=notes)
+    used = max(have)
+    if unpriced:
+        notes = notes[:300] + f" {unpriced} call(s) are unpriced, so the logged cost is a floor."
+    extra = {"computed_usd": computed, "console_usd": console_usd,
+             "console_at": console_at.isoformat() if console_at else None, "calls_month": calls,
+             "unpriced_calls": unpriced, "basis": "max(computed from our logs, latest console reading this month)"}
+    if sb_error:
+        extra["switchboard_error"] = sb_error
+    window = QuotaWindow(name="month", used_pct=round(used / limit * 100.0, 3), used=round(used, 8), limit=limit,
+                         unit="USD", resets_at=reset)
+    return QuotaReading(id=vid, name=name, source=src, source_kind="our_logs", plan=plan, fetched_at=now,
+                        windows=[window], extra=extra, notes=notes[:400], stale_after_s=1800)
 
 
 async def read_gemini_api(client) -> QuotaReading:
@@ -324,6 +413,6 @@ SERVER_READERS = {
     # 300 s: the proxies drop a reading without a reset time 15 min after this read (2026-10-19:
     # they stopped polling Ollama themselves and take this reading through Switchboard).
     "ollama_cloud": (read_ollama, "OLLAMA_CLOUD_API_KEY", 300),
-    "mistral": (read_mistral, None, 600),
+    "mistral": (read_mistral, None, 300),
     "gemini_api": (read_gemini_api, None, 600),
 }

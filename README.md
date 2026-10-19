@@ -141,7 +141,8 @@ Switchboard polls `GET /api/quota` and hands each proxy only the vendors in its 
 | pgsgrove | vendor API | `api.pgsgrove.com/v1/usage` (`PGSGROVE_API_KEY`) |
 | Synthetic | vendor API | `api.synthetic.new/v2/quotas` (`SYNTHETIC_API_KEY`) — 5-hour requests, weekly credits (regenerating), request counters; reading it does not count against the limits |
 | Ollama Cloud | vendor API | `ollama.com/api/usage` (`OLLAMA_CLOUD_API_KEY`) — request counts only |
-| Mistral, Gemini API | our logs | neither publishes plan usage; Switchboard's `/api/backend-usage` (7-day calls and tokens) |
+| Mistral (education key) | our logs + console | one monthly dollar window against `MISTRAL_MONTHLY_USD` (default 15, resets on the 1st; pay-as-you-go is off, so it is a hard stop): the larger of our proxies' calls at list price (Switchboard `/api/backend-usage`, `cost_usd` since the 1st) and the latest admin-console figure for this month (below) |
+| Gemini API | our logs | Google publishes no per-key usage; Switchboard's `/api/backend-usage` (7-day calls and tokens) |
 | Claude Max, Cursor, Copilot | client | herdr's usage reader (`collectors/client_usage_collector.py`) |
 | Antigravity | client | `antigravity-usage quota --json` |
 | Cline | client | `statusline-cline --quota --json` |
@@ -156,9 +157,23 @@ marked stale.
 |----------|---------|
 | `RECKONER_QUOTA_TOKEN` | Bearer token for reading `/api/quota` without a login (Switchboard) |
 | `RECKONER_INGEST_TOKEN` | Bearer token for collectors posting to `/api/quota/ingest`. Unset → ingest is off (503) |
-| `RECKONER_INGEST_IDS` | Vendor ids a collector may write (default `claude_max,cursor,copilot,antigravity,cline,muse,opencode_cli`) |
+| `RECKONER_INGEST_IDS` | Vendor ids a collector may write (default `claude_max,cursor,copilot,antigravity,cline,muse,opencode_cli,mistral_console`) |
 | `RECKONER_DB_PATH` | SQLite file. In Docker set `/app/data/tracker.db` so it lives in the volume |
+| `MISTRAL_MONTHLY_USD` | Mistral's included monthly API allowance in USD (default `15`; bad values fall back to it) |
 | `SWITCHBOARD_URL` | Switchboard base URL for the our-logs vendors (unset → those two cards say so) |
+
+Recording a Mistral console reading (Mistral has no usage API, and traffic outside our proxies, such as the
+free-model gateway or hand tests, never reaches Switchboard): read "Month to date" cost off the admin console
+and post it with the ingest token. The Mistral card shows the larger of this and our own logged cost, and only
+a reading taken in the current calendar month counts.
+
+```bash
+curl -s -X POST "$RECKONER_URL/api/quota/ingest" -H "Authorization: Bearer $RECKONER_INGEST_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"source": "console", "readings": [{
+    "id": "mistral_console", "name": "Mistral admin console", "source": "Mistral admin console (entered by hand)",
+    "source_kind": "client", "fetched_at": "2026-10-19T22:44:00Z",
+    "windows": [{"name": "month", "used": 1.18, "limit": 15, "unit": "USD"}]}]}'
+```
 
 The client collector runs on the workstation where those clients are signed in, every 5 minutes
 from launchd (`collectors/com.reckoner.usage-collector.plist`, a template: replace `__HOME__`).
