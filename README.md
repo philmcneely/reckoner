@@ -139,6 +139,7 @@ Switchboard polls `GET /api/quota` and hands each proxy only the vendors in its 
 | OpenCode Go | vendor API | `opencode.ai/zen/go/v1/usage` (`OPENCODE_GO_API_KEY`) |
 | NanoGPT | vendor API | `nano-gpt.com/api/subscription/v1/usage` (`NANOGPT_API_KEY`) — the source opencode's quota sidebar uses |
 | pgsgrove | vendor API | `api.pgsgrove.com/v1/usage` (`PGSGROVE_API_KEY`) |
+| Synthetic | vendor API | `api.synthetic.new/v2/quotas` (`SYNTHETIC_API_KEY`) — 5-hour requests, weekly credits (regenerating), request counters; reading it does not count against the limits |
 | Ollama Cloud | vendor API | `ollama.com/api/usage` (`OLLAMA_CLOUD_API_KEY`) — request counts only |
 | Mistral, Gemini API | our logs | neither publishes plan usage; Switchboard's `/api/backend-usage` (7-day calls and tokens) |
 | Claude Max, Cursor, Copilot | client | herdr's usage reader (`collectors/client_usage_collector.py`) |

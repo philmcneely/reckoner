@@ -16,6 +16,12 @@ Verified 2026-10-18 against the live APIs:
   pgsgrove    GET https://api.pgsgrove.com/v1/usage                       (Bearer key, curl UA)
               weekly_used_percent, daily_used_percent, weekly_resets_at. Banked full-speed time:
               at the cap it slows down, it does not stop.
+  Synthetic   GET https://api.synthetic.new/v2/quotas                     (Bearer key; /quotas reads do not
+              count against the limits). Read live 2026-10-19: rollingFiveHourLimit.{max,remaining,
+              nextTickAt,limited} = the 5-hour request allowance; weeklyTokenLimit.{percentRemaining,
+              maxCredits,remainingCredits ("$60.00" strings),nextRegenAt} = weekly credits, which regenerate
+              continuously (nextRegenAt is the next tick, not a reset); subscription / search.hourly /
+              freeToolCalls.{limit,requests,renewsAt} = request counters (limit 0 = not on this plan).
   Ollama      GET https://ollama.com/api/usage                            (Bearer usage key) — since
               2026-10-17 it answers request counts only ({range, totals.request_count, buckets});
               the plan limits are no longer published.
@@ -184,6 +190,75 @@ async def read_pgsgrove(client, key) -> QuotaReading:
         return _fail(vid, name, src, "api", e, key)
 
 
+def _usd(v) -> Optional[float]:
+    """"$56.70" -> 56.7; None for anything that is not a plain non-negative dollar amount."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        out = float(v)
+    elif isinstance(v, str):
+        try:
+            out = float(v.strip().lstrip("$").replace(",", ""))
+        except ValueError:
+            return None
+    else:
+        return None
+    return out if 0 <= out < 1e12 else None
+
+
+def _count_window(name, d) -> Optional[QuotaWindow]:
+    """A {limit, requests, renewsAt} counter; None when the plan has no such allowance (limit 0)."""
+    if not isinstance(d, dict):
+        return None
+    limit, used = _num(d.get("limit")), _num(d.get("requests"))
+    if not limit or limit < 0 or used is None or used < 0:
+        return None
+    return QuotaWindow(name=name, used_pct=round(used / limit * 100.0, 3), used=used, limit=limit, unit="requests",
+                       resets_at=_ts(d.get("renewsAt")))
+
+
+async def read_synthetic(client, key) -> QuotaReading:
+    vid, name, src = "synthetic", "Synthetic", "synthetic.new quotas API"
+    try:
+        d = await _get_json(client, "https://api.synthetic.new/v2/quotas", {"Authorization": f"Bearer {key}"})
+        if not isinstance(d, dict):
+            raise RuntimeError("answer is not an object")
+        windows, extra = [], {}
+        five = d.get("rollingFiveHourLimit")
+        if isinstance(five, dict):
+            cap, left = _num(five.get("max")), _num(five.get("remaining"))
+            if cap and cap > 0 and left is not None:
+                used = min(max(cap - left, 0.0), cap)
+                pct = 100.0 if five.get("limited") is True else round(used / cap * 100.0, 3)
+                windows.append(QuotaWindow(name="5h", used_pct=pct, used=used, limit=cap, unit="requests",
+                                           resets_at=_ts(five.get("nextTickAt"))))
+                extra["limited"] = five.get("limited") is True
+                extra["tick_percent"] = _num(five.get("tickPercent"))
+        week = d.get("weeklyTokenLimit")
+        if isinstance(week, dict):
+            left_pct = _num(week.get("percentRemaining"))
+            cap, left = _usd(week.get("maxCredits")), _usd(week.get("remainingCredits"))
+            pct = round(min(max(100.0 - left_pct, 0.0), 100.0), 3) if left_pct is not None else (
+                round(min(max((cap - left) / cap * 100.0, 0.0), 100.0), 3) if cap and left is not None else None)
+            if pct is not None:
+                have = cap is not None and left is not None
+                windows.append(QuotaWindow(name="weekly", used_pct=pct, used=round(max(cap - left, 0.0), 4) if have else None,
+                                           limit=cap if have else None, unit="USD" if have else None,
+                                           resets_at=_ts(week.get("nextRegenAt"))))
+                extra["weekly_regen_credits"] = _usd(week.get("nextRegenCredits"))
+        for wname, node in (("subscription", d.get("subscription")),
+                            ("search-hourly", (d.get("search") or {}).get("hourly") if isinstance(d.get("search"), dict) else None)):
+            w = _count_window(wname, node)
+            if w:
+                windows.append(w)
+        if not windows:
+            raise RuntimeError("no quota windows in answer")
+        return QuotaReading(id=vid, name=name, source=src, source_kind="api", fetched_at=_now(), windows=windows,
+                            extra={k: v for k, v in extra.items() if v is not None}, stale_after_s=900,
+                            notes="Weekly credits regenerate continuously; the weekly time is the next regeneration "
+                                  "tick, not a reset. Reading /v2/quotas does not count against the limits.")
+    except Exception as e:  # noqa: BLE001
+        return _fail(vid, name, src, "api", e, key)
+
+
 async def read_ollama(client, key) -> QuotaReading:
     vid, name, src = "ollama_cloud", "Ollama Cloud", "ollama.com usage API"
     note = ("Since 2026-10-17 Ollama's usage API reports request counts only; plan limits are not "
@@ -245,6 +320,7 @@ SERVER_READERS = {
     "opencode_go": (read_opencode_go, "OPENCODE_GO_API_KEY", 180),
     "nanogpt": (read_nanogpt, "NANOGPT_API_KEY", 300),
     "pgsgrove": (read_pgsgrove, "PGSGROVE_API_KEY", 300),
+    "synthetic": (read_synthetic, "SYNTHETIC_API_KEY", 300),
     # 300 s: the proxies drop a reading without a reset time 15 min after this read (2026-10-19:
     # they stopped polling Ollama themselves and take this reading through Switchboard).
     "ollama_cloud": (read_ollama, "OLLAMA_CLOUD_API_KEY", 300),

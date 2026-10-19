@@ -114,6 +114,72 @@ def test_nanogpt_reader_uses_subscription_usage():
     assert "daily-images" in w and r.plan == "subscription (active)"
 
 
+# Shape of GET https://api.synthetic.new/v2/quotas (Bearer key), read live 2026-10-19; values here are
+# invented. Credit amounts are dollar strings; limits and counts are numbers; times are ISO strings.
+SYNTHETIC = {
+    "subscription": {"limit": 500, "requests": 125, "renewsAt": "2026-10-19T23:18:37.976Z"},
+    "search": {"hourly": {"limit": 250, "requests": 50, "renewsAt": "2026-10-19T21:18:37.977Z"}},
+    "freeToolCalls": {"limit": 0, "requests": 0, "renewsAt": "2026-10-20T23:18:37.985Z"},
+    "weeklyTokenLimit": {"nextRegenAt": "2026-10-19T22:54:06.000Z", "percentRemaining": 94.5,
+                         "maxCredits": "$60.00", "remainingCredits": "$56.70", "nextRegenCredits": "$1.20"},
+    "rollingFiveHourLimit": {"nextTickAt": "2026-10-19T23:30:16.000Z", "tickPercent": 0.05,
+                             "remaining": 400, "max": 500, "limited": False},
+}
+
+
+def test_synthetic_reader_maps_every_window():
+    seen = {}
+
+    def h(req):
+        seen["url"] = str(req.url)
+        seen["auth"] = req.headers.get("authorization")
+        return httpx.Response(200, json=SYNTHETIC)
+    r = run(readers.read_synthetic(client_for(h), "sk"))
+    assert seen["url"] == "https://api.synthetic.new/v2/quotas" and seen["auth"] == "Bearer sk"
+    assert r.ok and r.id == "synthetic" and r.source_kind == "api"
+    w = {x.name: x for x in r.windows}
+    assert set(w) == {"5h", "weekly", "subscription", "search-hourly"}  # freeToolCalls has limit 0: no window
+    assert w["5h"].used == 100 and w["5h"].limit == 500 and w["5h"].unit == "requests" and w["5h"].used_pct == 20.0
+    assert w["5h"].resets_at is not None
+    assert abs(w["weekly"].used_pct - 5.5) < 0.01 and w["weekly"].unit == "USD"  # 100 - percentRemaining
+    assert abs(w["weekly"].used - 3.3) < 0.001 and w["weekly"].limit == 60.0
+    assert w["weekly"].resets_at is not None
+    assert w["subscription"].used_pct == 25.0 and w["subscription"].limit == 500
+    assert w["search-hourly"].used_pct == 20.0 and w["search-hourly"].unit == "requests"
+
+
+def test_synthetic_limited_means_full():
+    doc = {"rollingFiveHourLimit": {"nextTickAt": "2026-10-19T23:30:16.000Z", "tickPercent": 0.05,
+                                    "remaining": 3, "max": 500, "limited": True}}
+    r = run(readers.read_synthetic(client_for(lambda req: httpx.Response(200, json=doc)), "sk"))
+    assert r.windows[0].name == "5h" and r.windows[0].used_pct == 100.0 and r.extra["limited"] is True
+
+
+def test_synthetic_survives_missing_and_odd_fields():
+    doc = {"weeklyTokenLimit": {"percentRemaining": "n/a", "maxCredits": "free", "remainingCredits": None},
+           "rollingFiveHourLimit": {"remaining": 5, "max": 0}, "subscription": "oops",
+           "search": {"hourly": {"limit": 10, "requests": True}}}
+    r = run(readers.read_synthetic(client_for(lambda req: httpx.Response(200, json=doc)), "sk"))
+    assert not r.ok and r.error  # nothing usable: say so rather than show an empty healthy card
+    r2 = run(readers.read_synthetic(client_for(lambda req: httpx.Response(200, json={})), "sk"))
+    assert not r2.ok
+
+
+def test_synthetic_rejected_key_and_no_key_leak():
+    r = run(readers.read_synthetic(client_for(lambda req: httpx.Response(401, json={"error": "nope"})), "sk-live-1"))
+    assert not r.ok and "401" in r.error
+
+    def h(req):
+        raise httpx.ConnectError("boom sk-live-1 boom")
+    r = run(readers.read_synthetic(client_for(h), "sk-live-1"))
+    assert not r.ok and "sk-live-1" not in r.error
+
+
+def test_synthetic_is_a_scheduled_server_reader():
+    reader, env, interval = readers.SERVER_READERS["synthetic"]
+    assert reader is readers.read_synthetic and env == "SYNTHETIC_API_KEY" and interval == 300
+
+
 def test_pgsgrove_reader():
     r = run(readers.read_pgsgrove(client_for(lambda req: httpx.Response(200, json={
         "weekly_used_percent": 12.5, "daily_used_percent": 0.1, "weekly_resets_at": "2026-10-20T00:00:00Z",
