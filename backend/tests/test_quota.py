@@ -285,3 +285,11 @@ def test_balance_scheduler_respects_each_provider_interval():
     assert due == ["zai"]  # never-refreshed only; the others aren't due (was: everything every 30 s)
     due_later = scheduler.due_providers({"openrouter": 300, "ollama_cloud": 600}, last, NOW + timedelta(seconds=280))
     assert due_later == ["openrouter"]
+
+
+def test_dashboard_login_token_reads_quota(api):
+    # The Plan usage panel sends the dashboard login token (frontend api.ts request()).
+    tok = api.post("/api/auth/login", json={"password": os.environ["RECKONER_PASSWORD"]}).json()["token"]
+    hdr = {"Authorization": "Bearer " + tok}
+    assert api.get("/api/quota", headers=hdr).status_code == 200
+    assert api.get("/api/quota/history/zai", headers=hdr).status_code == 200
