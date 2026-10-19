@@ -146,12 +146,15 @@ export function ProviderCard({ snapshot, onRefreshed }: ProviderCardProps) {
   const total     = snapshot.total_credits;
   const used      = snapshot.used_credits;
   const isCredits = snapshot.currency === 'credits';
+  // Request counts (Ollama Cloud since it stopped publishing limits): a count, not money.
+  const isRequests = snapshot.currency === 'requests';
   const fmt       = isCredits ? formatCredits : formatUSD;
 
   const raw = snapshot.raw_data ?? {};
   const thirtyDaySpend = typeof raw.thirty_day_spend_usd === 'number' ? raw.thirty_day_spend_usd : null;
   const usageMonthly   = typeof raw.usage_monthly        === 'number' ? raw.usage_monthly        : null;
   const noteText       = typeof raw.note                 === 'string' ? raw.note                 : null;
+  const countRange     = typeof raw.range                === 'string' ? raw.range                : null;
 
   // ── Billing period (Firecrawl, etc.) ──────────────────────────────────
   const billingPeriodEnd   = typeof raw.billing_period_end   === 'string' ? raw.billing_period_end   : null;
@@ -302,9 +305,11 @@ export function ProviderCard({ snapshot, onRefreshed }: ProviderCardProps) {
 
         {mode === 'used' && used !== null && (
           <div>
-            <p className="text-xs text-gray-500 uppercase tracking-wide mb-0.5">Total Used</p>
+            <p className="text-xs text-gray-500 uppercase tracking-wide mb-0.5">
+              {isRequests ? `Requests${countRange ? ` (last ${countRange})` : ''}` : 'Total Used'}
+            </p>
             <p className="text-2xl font-bold tabular-nums text-blue-400">
-              {formatUSD(used)}
+              {isRequests ? Math.round(used).toLocaleString() : formatUSD(used)}
             </p>
           </div>
         )}

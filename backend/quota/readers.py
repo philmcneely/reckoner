@@ -245,7 +245,9 @@ SERVER_READERS = {
     "opencode_go": (read_opencode_go, "OPENCODE_GO_API_KEY", 180),
     "nanogpt": (read_nanogpt, "NANOGPT_API_KEY", 300),
     "pgsgrove": (read_pgsgrove, "PGSGROVE_API_KEY", 300),
-    "ollama_cloud": (read_ollama, "OLLAMA_CLOUD_API_KEY", 900),
+    # 300 s: the proxies drop a reading without a reset time 15 min after this read (2026-10-19:
+    # they stopped polling Ollama themselves and take this reading through Switchboard).
+    "ollama_cloud": (read_ollama, "OLLAMA_CLOUD_API_KEY", 300),
     "mistral": (read_mistral, None, 600),
     "gemini_api": (read_gemini_api, None, 600),
 }

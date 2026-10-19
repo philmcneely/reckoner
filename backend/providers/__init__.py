@@ -224,7 +224,8 @@ AI_PROVIDERS = {
         "auth_help": "Generate a usage-reporting API key at ollama.com/settings → API keys",
         "tier": 1,
         "refresh_interval": 1800,
-        "note": "Quota-based (not USD) — shows weekly quota usage as a percentage.",
+        "note": "Quota-based (not USD): request counts since Ollama stopped publishing limits (2026-10-17); "
+                "weekly quota percentage if it publishes them again.",
     },
     "nanogpt": {
         "class": NanoGPTProvider,

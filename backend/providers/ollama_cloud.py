@@ -1,5 +1,10 @@
 """
-Ollama Cloud provider — fetches weekly/session quota usage.
+Ollama Cloud provider — request counts, or weekly/session quota usage when Ollama publishes it.
+
+Since 2026-10-17 the usage endpoint answers request counts only:
+    {"range": "week", "scope": ..., "totals": {"request_count": N}, "buckets": [...]}
+with no limits.*.usage. The card then shows the request count (currency "requests") instead of an
+error. The older shape below, should it come back, still shows the weekly percentage.
 
 Ollama Cloud (ollama.com) does not sell prepaid USD credits for its hosted
 :cloud models — it meters usage against rolling session and weekly quotas
@@ -71,9 +76,12 @@ class OllamaCloudProvider(BaseProvider):
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 401:
+            code = e.response.status_code
+            if code == 401:
                 return self._error_snapshot("Invalid API key")
-            return self._error_snapshot(f"HTTP {e.response.status_code}: {e.response.text[:200]}")
+            if code == 429:
+                return self._error_snapshot("HTTP 429 (Ollama rate-limited this read)")
+            return self._error_snapshot(f"HTTP {code}")
         except httpx.RequestError as e:
             return self._error_snapshot(f"Network error: {str(e)}")
         except Exception as e:
@@ -86,7 +94,20 @@ class OllamaCloudProvider(BaseProvider):
 
         weekly_usage_frac = weekly.get("usage")
         if weekly_usage_frac is None:
-            return self._error_snapshot("Ollama usage response missing limits.weekly.usage")
+            totals = data.get("totals") if isinstance(data.get("totals"), dict) else {}
+            count = totals.get("request_count")
+            if isinstance(count, bool) or not isinstance(count, (int, float)):
+                return self._error_snapshot("Ollama usage response has neither limits nor request counts")
+            return self._make_snapshot(
+                used_credits = float(count),
+                currency     = "requests",
+                raw_data     = {
+                    "request_count": int(count),
+                    "range":         data.get("range"),
+                    "note":          "Ollama's usage API reports request counts only (since 2026-10-17); "
+                                     "no plan limits are published.",
+                },
+            )
 
         weekly_used_pct      = round(float(weekly_usage_frac) * 100, 2)
         weekly_remaining_pct = round(100.0 - weekly_used_pct, 2)
