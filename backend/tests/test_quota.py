@@ -212,6 +212,56 @@ def test_quota_read_needs_token_or_login(api):
     assert api.get("/api/quota", headers={"Authorization": "Bearer nope"}).status_code == 401
 
 
+# A credential is required on the quota reads and on refresh whenever a read token or a dashboard
+# password is configured, whatever RECKONER_PROTECT_DASHBOARD says.
+
+def test_quota_reads_need_a_credential_with_dashboard_protection_off(api, monkeypatch):
+    import auth
+    from quota import router as qr
+    monkeypatch.setattr(auth, "protect_dashboard", False)
+    monkeypatch.setattr(qr, "protect_dashboard", False, raising=False)
+    assert api.get("/api/quota").status_code == 401
+    assert api.get("/api/quota/history/zai").status_code == 401
+    ok = api.get("/api/quota", headers={"Authorization": "Bearer " + os.environ["RECKONER_QUOTA_TOKEN"]})
+    assert ok.status_code == 200
+
+
+def test_quota_reads_need_the_read_token_with_auth_off(api, monkeypatch):
+    from quota import router as qr
+    monkeypatch.setattr(qr, "auth_enabled", False)
+    assert api.get("/api/quota").status_code == 401
+    assert api.get("/api/quota/history/zai").status_code == 401
+    assert api.post("/api/quota/refresh").status_code == 401
+    hdr = {"Authorization": "Bearer " + os.environ["RECKONER_QUOTA_TOKEN"]}
+    assert api.get("/api/quota", headers=hdr).status_code == 200
+    assert api.get("/api/quota/history/zai", headers=hdr).status_code == 200
+
+
+def test_quota_open_only_when_nothing_is_configured(api, monkeypatch):
+    from quota import router as qr
+    monkeypatch.setattr(qr, "auth_enabled", False)
+    monkeypatch.setattr(qr, "_READ_TOKEN", "")
+    assert api.get("/api/quota").status_code == 200
+
+
+def test_refresh_needs_login_when_auth_is_on(api):
+    assert api.post("/api/quota/refresh").status_code == 401
+    assert api.post("/api/quota/refresh", headers={"Authorization": "Bearer nope"}).status_code == 401
+
+
+def test_non_ascii_authorization_is_401_not_500(api):
+    hdr = {"Authorization": "Bearer t\u00f6ken-\u00fc".encode("utf-8")}
+    assert api.get("/api/quota", headers=hdr).status_code == 401
+    assert api.get("/api/quota/history/zai", headers=hdr).status_code == 401
+    assert api.post("/api/quota/refresh", headers=hdr).status_code == 401
+    assert api.post("/api/quota/ingest", json=_ingest_body(), headers=hdr).status_code == 401
+
+
+def test_non_ascii_login_password_is_401_not_500(api):
+    r = api.post("/api/auth/login", json={"password": "p\u00e4sswort"})
+    assert r.status_code == 401
+
+
 def test_stale_reading_is_flagged(api):
     old = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
     api.post("/api/quota/ingest", json=_ingest_body(id="cursor", name="Cursor", fetched_at=old, stale_after_s=900),

@@ -47,7 +47,8 @@ def create_token(password: str) -> Optional[str]:
         return None
 
     # Constant-time comparison to prevent timing attacks.
-    if not secrets.compare_digest(password, _PASSWORD):
+    # Bytes, so a non-ASCII password is a mismatch rather than a TypeError (500).
+    if not secrets.compare_digest(password.encode("utf-8"), _PASSWORD.encode("utf-8")):
         return None
 
     payload = {

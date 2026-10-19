@@ -3,11 +3,16 @@
 GET  /api/quota                 every vendor's latest reading. Auth: the read token
                                 (RECKONER_QUOTA_TOKEN, for Switchboard) or a dashboard login.
 GET  /api/quota/history/{id}    one vendor's readings over `hours`. Same auth.
-POST /api/quota/refresh         read every server-side vendor now. Dashboard login.
+POST /api/quota/refresh         read every server-side vendor now. Dashboard login (the read
+                                token when no dashboard password is set).
 POST /api/quota/ingest          client-side readers (collectors/) push readings. Auth: the
                                 ingest token (RECKONER_INGEST_TOKEN). Only the client-sourced ids
                                 (RECKONER_INGEST_IDS) are accepted, so a client can never overwrite a
                                 vendor Reckoner reads from the vendor's own API.
+
+Whenever a read token or a dashboard password is configured, the reads and refresh need one of
+them, whatever RECKONER_PROTECT_DASHBOARD says. Only with neither configured (local dev) are they
+open.
 """
 
 import os
@@ -16,7 +21,7 @@ import secrets
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import ValidationError
 
-from auth import auth_enabled, protect_dashboard, verify_token
+from auth import auth_enabled, verify_token
 from quota import store
 from quota.models import ID_PATTERN, IngestPayload
 
@@ -36,23 +41,33 @@ def _bearer(request: Request) -> str:
     return h[7:] if h.startswith("Bearer ") else ""
 
 
+def _token_eq(given: str, expected: str) -> bool:
+    """Constant-time compare on bytes: a non-ASCII header is a mismatch, never a TypeError (500)."""
+    return bool(given and expected) and secrets.compare_digest(given.encode("utf-8"), expected.encode("utf-8"))
+
+
+def _unauthorized() -> HTTPException:
+    return HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentication required", headers={"WWW-Authenticate": "Bearer"})
+
+
 def _require_read(request: Request) -> None:
+    if not _READ_TOKEN and not auth_enabled:
+        return
     tok = _bearer(request)
-    if _READ_TOKEN and tok and secrets.compare_digest(tok, _READ_TOKEN):
+    if _token_eq(tok, _READ_TOKEN):
         return
-    if not auth_enabled or not protect_dashboard:
+    if auth_enabled and tok and verify_token(tok):
         return
-    if tok and verify_token(tok):
-        return
-    raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentication required", headers={"WWW-Authenticate": "Bearer"})
+    raise _unauthorized()
 
 
 def _require_login(request: Request) -> None:
-    if not auth_enabled:
+    if auth_enabled:
+        tok = _bearer(request)
+        if not tok or not verify_token(tok):
+            raise _unauthorized()
         return
-    tok = _bearer(request)
-    if not tok or not verify_token(tok):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentication required", headers={"WWW-Authenticate": "Bearer"})
+    _require_read(request)
 
 
 @router.get("")
@@ -84,7 +99,7 @@ async def ingest(request: Request):
     if not _INGEST_TOKEN:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "ingest disabled (no RECKONER_INGEST_TOKEN)")
     tok = _bearer(request)
-    if not tok or not secrets.compare_digest(tok, _INGEST_TOKEN):
+    if not _token_eq(tok, _INGEST_TOKEN):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "bad ingest token", headers={"WWW-Authenticate": "Bearer"})
     try:
         declared = int(request.headers.get("content-length") or 0)
