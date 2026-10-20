@@ -327,20 +327,28 @@ def _month_bounds(now: datetime):
 
 
 def _console_month_usd(doc, start: datetime, reset: datetime):
-    """(used USD, read time) from a mistral_console reading, only when it was read in this calendar month."""
+    """(used USD, read time) from a mistral_console reading, only when it was read in this calendar month.
+    The read time is fetched_at, or, for a reading posted without one, when it was stored. The window is the
+    one named like "month" (month, monthly, month-to-date), else the only USD window; the amount may be a
+    number or a "$1.18" string."""
     if not isinstance(doc, dict) or doc.get("ok") is False:
         return None, None
-    at = _ts(doc.get("fetched_at"))
+    at = _ts(doc.get("fetched_at")) or _ts(doc.get("stored_at"))
     if at is None or not (start <= at < reset):
         return None, None
-    for w in doc.get("windows") or []:
-        if isinstance(w, dict) and w.get("name") == "month":
-            used = _num(w.get("used"))
-            if used is None and _num(w.get("used_pct")) is not None and _num(w.get("limit")):
-                used = _num(w.get("used_pct")) / 100.0 * _num(w.get("limit"))
-            if used is not None and 0 <= used < 1e9:
-                return used, at
-    return None, None
+    wins = [w for w in (doc.get("windows") or []) if isinstance(w, dict)]
+    pick = next((w for w in wins if "month" in str(w.get("name", "")).lower()), None)
+    if pick is None:
+        usd = [w for w in wins if str(w.get("unit", "")).upper() == "USD"]
+        pick = usd[0] if len(usd) == 1 else None
+    if pick is None:
+        return None, None
+    used = _usd(pick.get("used"))
+    limit = _usd(pick.get("limit"))
+    pct = _num(pick.get("used_pct"))
+    if used is None and pct is not None and limit:
+        used = pct / 100.0 * limit
+    return (used, at) if used is not None and 0 <= used < 1e9 else (None, None)
 
 
 async def read_mistral(client, console=_UNSET, now: Optional[datetime] = None) -> QuotaReading:
@@ -386,6 +394,8 @@ async def read_mistral(client, console=_UNSET, now: Optional[datetime] = None) -
     used = max(have)
     if unpriced:
         notes = notes[:300] + f" {unpriced} call(s) are unpriced, so the logged cost is a floor."
+    if computed is None:
+        notes = notes[:325] + " Switchboard cost unavailable: this is the admin-console figure only."
     extra = {"computed_usd": computed, "console_usd": console_usd,
              "console_at": console_at.isoformat() if console_at else None, "calls_month": calls,
              "unpriced_calls": unpriced, "basis": "max(computed from our logs, latest console reading this month)"}

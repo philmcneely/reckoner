@@ -102,6 +102,10 @@ async def latest_one(vendor: str) -> dict | None:
     """One vendor's latest stored reading (None if there is none). A failed read is returned as stored."""
     await init_quota_tables()
     async with get_db() as db:
-        async with db.execute("SELECT reading FROM quota_latest WHERE vendor = ?", (vendor,)) as cur:
+        async with db.execute("SELECT reading, stored_at FROM quota_latest WHERE vendor = ?", (vendor,)) as cur:
             row = await cur.fetchone()
-    return json.loads(row[0]) if row else None
+    if not row:
+        return None
+    doc = json.loads(row[0])
+    doc["stored_at"] = row[1]      # when we got it: the only date a hand-posted reading without fetched_at has
+    return doc

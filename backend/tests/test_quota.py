@@ -328,6 +328,56 @@ def test_mistral_old_switchboard_without_cost_field(sb_env):
     assert not _mistral(old, console=None).ok
 
 
+def _old_switchboard(req):
+    return httpx.Response(200, json={"backend": "mistral", "calls": 13, "input_tokens": 1})
+
+
+def test_mistral_console_alone_is_enough_and_says_so(sb_env):
+    for handler in (_old_switchboard, lambda req: httpx.Response(500), lambda req: httpx.Response(200, text="not json")):
+        r = _mistral(handler, console=_console(1.18))
+        assert r.ok and r.windows and r.windows[0].used == pytest.approx(1.18), handler
+        assert "console" in r.notes.lower() and "switchboard" in r.notes.lower()
+        assert r.extra["computed_usd"] is None and r.extra["switchboard_error"]
+
+
+def test_mistral_console_without_fetched_at_counts_by_when_it_was_stored(sb_env):
+    # a hand-posted reading may leave fetched_at out; the store's own stored_at says which month it is from
+    doc = _console(1.18)
+    del doc["fetched_at"]
+    doc["stored_at"] = datetime(2026, 10, 19, 22, 50, tzinfo=timezone.utc).isoformat()
+    assert _mistral(_old_switchboard, console=doc).windows[0].used == pytest.approx(1.18)
+    doc["stored_at"] = datetime(2026, 9, 30, 22, 50, tzinfo=timezone.utc).isoformat()
+    assert not _mistral(_old_switchboard, console=doc).ok          # last month's, and nothing else to show
+    del doc["stored_at"]
+    assert not _mistral(_old_switchboard, console=doc).ok          # no time at all: cannot tell the month
+
+
+def test_mistral_console_window_name_and_value_forms(sb_env):
+    for name in ("Month", "monthly", "month-to-date", "month_to_date"):
+        doc = _console(1.18)
+        doc["windows"][0]["name"] = name
+        assert _mistral(_old_switchboard, console=doc).windows[0].used == pytest.approx(1.18), name
+    for used in ("1.18", "$1.18", " 1.18 "):
+        doc = _console(1.18)
+        doc["windows"][0]["used"] = used
+        assert _mistral(_old_switchboard, console=doc).windows[0].used == pytest.approx(1.18), used
+    doc = _console(1.18)                                              # one USD window under any name
+    doc["windows"][0]["name"] = "console"
+    assert _mistral(_old_switchboard, console=doc).windows[0].used == pytest.approx(1.18)
+    doc["windows"][0]["unit"] = "requests"
+    assert not _mistral(_old_switchboard, console=doc).ok
+
+
+def test_mistral_console_posted_without_fetched_at_works_through_the_store(api, sb_env):
+    hdr = {"Authorization": "Bearer " + os.environ["RECKONER_INGEST_TOKEN"]}
+    body = {"source": "console", "readings": [{
+        "id": "mistral_console", "name": "Mistral admin console", "source": "console", "source_kind": "client",
+        "windows": [{"name": "month", "used": 2.5, "limit": 15, "unit": "USD"}]}]}
+    assert api.post("/api/quota/ingest", json=body, headers=hdr).status_code == 200
+    r = run(readers.read_mistral(client_for(_old_switchboard)))     # console loaded from the store, old Switchboard
+    assert r.ok and r.windows[0].used == pytest.approx(2.5), r.error
+
+
 def test_mistral_unpriced_calls_make_the_cost_a_floor(sb_env):
     r = _mistral(_usage_handler({}, unpriced_calls=4))
     assert r.extra["unpriced_calls"] == 4 and "floor" in r.notes.lower()
