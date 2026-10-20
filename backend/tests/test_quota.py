@@ -180,6 +180,87 @@ def test_synthetic_is_a_scheduled_server_reader():
     assert reader is readers.read_synthetic and env == "SYNTHETIC_API_KEY" and interval == 300
 
 
+# Shapes of Command Code's own billing API (the three GETs behind its CLI's /usage), read live 2026-10-20 with the
+# account key as a Bearer token on https://api.commandcode.ai. Numbers here are invented.
+CC_CREDITS = {"credits": {"belowThreshold": False, "creditThreshold": 0, "monthlyCredits": 55.0, "purchasedCredits": 4.5,
+                          "freeCredits": 1.25},
+              "windowLimits": {"limited": True, "exceeded": None,
+                               "fiveHour": {"used": 3.5, "cap": 14, "exceeded": False, "resetAt": 1792382686000},
+                               "weekly": {"used": 14.0, "cap": 35, "exceeded": False, "resetAt": 1792665914944}},
+              "sandboxAccess": True, "sandboxMinutes": {"usedMinutes": 0, "limitMinutes": 0, "overageUsd": 0, "resetAt": 1793491200000}}
+CC_SUB = {"success": True, "data": {"status": "active", "planId": "individual-goat", "orgId": None,
+                                     "currentPeriodStart": "2026-10-10T02:00:00.000Z", "currentPeriodEnd": "2026-11-10T02:00:00.000Z"}}
+CC_SUMMARY = {"totalCount": 40, "totalCost": 15.0, "totalCredits": 15.0, "totalMonthlyCredits": 15.0, "totalPurchasedCredits": 0,
+              "periodBasis": "billing-period", "periodStart": "2026-10-10T02:00:00.000Z", "daily": []}
+
+
+def _cc_handler(seen, credits=CC_CREDITS, sub=CC_SUB, summary=CC_SUMMARY):
+    def h(req):
+        seen.setdefault("calls", []).append((req.url.path, dict(req.url.params)))
+        seen["auth"] = req.headers.get("authorization")
+        out = {"/alpha/billing/credits": credits, "/alpha/billing/subscriptions": sub, "/alpha/usage/summary": summary}[req.url.path]
+        return out if isinstance(out, httpx.Response) else httpx.Response(200, json=out)
+    return h
+
+
+def test_commandcode_reader_maps_the_windows():
+    seen = {}
+    r = run(readers.read_commandcode(client_for(_cc_handler(seen)), "cc-key"))
+    assert seen["auth"] == "Bearer cc-key"
+    assert [c[0] for c in seen["calls"]] == ["/alpha/billing/credits", "/alpha/billing/subscriptions", "/alpha/usage/summary"]
+    assert seen["calls"][2][1] == {"since": "2026-10-10T02:00:00.000Z"}
+    assert r.ok and r.id == "commandcode" and r.source_kind == "api" and r.plan == "individual-goat"
+    w = {x.name: x for x in r.windows}
+    assert set(w) == {"5h", "weekly", "monthly"}
+    assert w["5h"].used == 3.5 and w["5h"].limit == 14 and w["5h"].unit == "USD" and w["5h"].used_pct == 25.0
+    assert w["5h"].resets_at == datetime.fromtimestamp(1792382686, tz=timezone.utc)
+    assert w["weekly"].used_pct == 40.0 and w["weekly"].resets_at is not None
+    # monthly: spent 15.00 of the period, 55.00 left -> a 70.00 pool
+    assert w["monthly"].used == 15.0 and w["monthly"].limit == 70.0 and abs(w["monthly"].used_pct - 21.429) < 0.001
+    assert w["monthly"].resets_at == datetime(2026, 11, 10, 2, 0, tzinfo=timezone.utc)
+    assert r.money == {"monthly_credits_left": 55.0, "purchased_credits": 4.5, "free_credits": 1.25}
+
+
+def test_commandcode_window_not_started_has_no_reset_and_exceeded_reads_full():
+    credits = json.loads(json.dumps(CC_CREDITS))
+    credits["windowLimits"]["fiveHour"].update(used=0, resetAt=0)
+    credits["windowLimits"]["weekly"].update(used=35, exceeded=True)
+    r = run(readers.read_commandcode(client_for(_cc_handler({}, credits=credits)), "k"))
+    w = {x.name: x for x in r.windows}
+    assert w["5h"].used_pct == 0 and w["5h"].resets_at is None          # resetAt 0 = the window has not started
+    assert w["weekly"].used_pct == 100.0
+
+
+def test_commandcode_plan_without_caps_or_monthly_pool():
+    credits = {"credits": {"monthlyCredits": 0, "purchasedCredits": 3, "freeCredits": 0}, "windowLimits": {"limited": False}}
+    r = run(readers.read_commandcode(client_for(_cc_handler({}, credits=credits, summary={"totalMonthlyCredits": 0})), "k"))
+    assert r.ok and r.windows == [] and r.money["purchased_credits"] == 3.0
+
+
+def test_commandcode_credits_alone_is_enough_when_the_others_fail():
+    sub_down = httpx.Response(500)
+    r = run(readers.read_commandcode(client_for(_cc_handler({}, sub=sub_down, summary=httpx.Response(500))), "k"))
+    assert r.ok and {x.name for x in r.windows} == {"5h", "weekly"} and r.plan is None
+    assert r.extra["monthly_unavailable"]
+
+
+def test_commandcode_errors_never_leak_the_key():
+    r = run(readers.read_commandcode(client_for(lambda req: httpx.Response(401, json={"error": "no"})), "cc-key-9"))
+    assert not r.ok and "401" in r.error and "cc-key-9" not in r.error
+
+    def h(req):
+        raise httpx.ConnectError("boom cc-key-9 boom")
+    r = run(readers.read_commandcode(client_for(h), "cc-key-9"))
+    assert not r.ok and "cc-key-9" not in r.error
+    r = run(readers.read_commandcode(client_for(lambda req: httpx.Response(200, json=["x"])), "k"))
+    assert not r.ok
+
+
+def test_commandcode_is_a_scheduled_server_reader():
+    reader, env, interval = readers.SERVER_READERS["commandcode"]
+    assert reader is readers.read_commandcode and env == "COMMANDCODE_API_KEY" and interval == 300
+
+
 def test_pgsgrove_reader():
     r = run(readers.read_pgsgrove(client_for(lambda req: httpx.Response(200, json={
         "weekly_used_percent": 12.5, "daily_used_percent": 0.1, "weekly_resets_at": "2026-10-20T00:00:00Z",
