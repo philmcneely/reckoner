@@ -158,7 +158,7 @@ marked stale.
 |----------|---------|
 | `RECKONER_QUOTA_TOKEN` | Bearer token for reading `/api/quota` without a login (Switchboard) |
 | `RECKONER_INGEST_TOKEN` | Bearer token for collectors posting to `/api/quota/ingest`. Unset → ingest is off (503) |
-| `RECKONER_INGEST_IDS` | Vendor ids a collector may write (default `claude_max,cursor,copilot,antigravity,cline,muse,opencode_cli,mistral_console`) |
+| `RECKONER_INGEST_IDS` | Vendor ids a collector may write (default `claude_max,cursor,copilot,antigravity,cline,muse,opencode_cli,mistral_console,dataimpulse`) |
 | `RECKONER_DB_PATH` | SQLite file. In Docker set `/app/data/tracker.db` so it lives in the volume |
 | `MISTRAL_MONTHLY_USD` | Mistral's included monthly API allowance in USD (default `15`; bad values fall back to it) |
 | `SWITCHBOARD_URL` | Switchboard base URL for the our-logs vendors (unset → those two cards say so) |

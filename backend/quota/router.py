@@ -31,7 +31,7 @@ _INGEST_TOKEN = os.environ.get("RECKONER_INGEST_TOKEN", "").strip()
 _READ_TOKEN = os.environ.get("RECKONER_QUOTA_TOKEN", "").strip()
 INGEST_IDS = frozenset(
     x.strip() for x in os.environ.get(
-        "RECKONER_INGEST_IDS", "claude_max,cursor,copilot,antigravity,cline,muse,opencode_cli,mistral_console").split(",")
+        "RECKONER_INGEST_IDS", "claude_max,cursor,copilot,antigravity,cline,muse,opencode_cli,mistral_console,dataimpulse").split(",")
     if x.strip())
 MAX_INGEST_BYTES = 256 * 1024
 
