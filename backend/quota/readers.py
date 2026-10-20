@@ -22,6 +22,11 @@ Verified 2026-10-18 against the live APIs:
               maxCredits,remainingCredits ("$60.00" strings),nextRegenAt} = weekly credits, which regenerate
               continuously (nextRegenAt is the next tick, not a reset); subscription / search.hourly /
               freeToolCalls.{limit,requests,renewsAt} = request counters (limit 0 = not on this plan).
+  Command Code GET https://api.commandcode.ai/alpha/billing/credits         (Bearer account key; the three GETs
+              /alpha/billing/subscriptions and /alpha/usage/summary?since=<period start> are what the CLI's own
+              /usage runs). Read live 2026-10-20: credits.{monthlyCredits (left), purchasedCredits, freeCredits},
+              windowLimits.{fiveHour,weekly}.{used,cap (USD),exceeded,resetAt (ms; 0 = window not started)},
+              subscription planId + currentPeriodEnd, summary.totalMonthlyCredits (spent this billing period).
   Ollama      GET https://ollama.com/api/usage                            (Bearer usage key) — since
               2026-10-17 it answers request counts only ({range, totals.request_count, buckets});
               the plan limits are no longer published.
@@ -35,6 +40,7 @@ human records as vendor `mistral_console` through /api/quota/ingest (see README)
 
 import math
 import os
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -264,6 +270,62 @@ async def read_synthetic(client, key) -> QuotaReading:
         return _fail(vid, name, src, "api", e, key)
 
 
+def _ms_ts(v) -> Optional[datetime]:
+    """Epoch-ms reset time; 0 / missing means the window has not started."""
+    return _ts(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else None
+
+
+async def read_commandcode(client, key) -> QuotaReading:
+    """Command Code (the agent CLI, one account key on every box): 5-hour and weekly dollar caps and a
+    monthly credit pool, from the same billing endpoints its CLI's /usage uses. The credits call is required;
+    the subscription (plan, period) and summary (spent this period) calls only add the plan and the monthly
+    window, so a failure of either leaves the other windows."""
+    vid, name, src = "commandcode", "Command Code", "commandcode.ai billing API"
+    base, hdr = "https://api.commandcode.ai", {"Authorization": f"Bearer {key}"}
+    try:
+        d = await _get_json(client, f"{base}/alpha/billing/credits", hdr)
+        if not isinstance(d, dict):
+            raise RuntimeError("credits answer is not an object")
+        credits = d.get("credits") if isinstance(d.get("credits"), dict) else {}
+        left = _num(credits.get("monthlyCredits"))
+        windows, extra = [], {}
+        caps = d.get("windowLimits") if isinstance(d.get("windowLimits"), dict) else {}
+        if caps.get("limited") is not False:
+            for field, wname in (("fiveHour", "5h"), ("weekly", "weekly")):
+                w = caps.get(field)
+                if not isinstance(w, dict):
+                    continue
+                cap, used = _num(w.get("cap")), _num(w.get("used"))
+                if not cap or cap <= 0 or used is None or used < 0:
+                    continue
+                pct = 100.0 if w.get("exceeded") is True else round(used / cap * 100.0, 3)
+                windows.append(QuotaWindow(name=wname, used_pct=pct, used=used, limit=cap, unit="USD",
+                                           resets_at=_ms_ts(w.get("resetAt"))))
+        plan, period_end, spent = None, None, None
+        try:
+            sub = await _get_json(client, f"{base}/alpha/billing/subscriptions", hdr)
+            data = sub.get("data") if isinstance(sub, dict) and isinstance(sub.get("data"), dict) else {}
+            plan = data.get("planId") if isinstance(data.get("planId"), str) else None
+            period_end, since = _ts(data.get("currentPeriodEnd")), data.get("currentPeriodStart")
+            q = urllib.parse.urlencode({"since": since}) if isinstance(since, str) and since else ""
+            summary = await _get_json(client, f"{base}/alpha/usage/summary" + (f"?{q}" if q else ""), hdr)
+            spent = _num(summary.get("totalMonthlyCredits")) if isinstance(summary, dict) else None
+        except Exception as e:  # noqa: BLE001 — the plan and the monthly window are extras
+            extra["monthly_unavailable"] = str(e).replace(key, "***")[:120]
+        if spent is not None and left is not None and spent >= 0 and left >= 0 and spent + left > 0:
+            pool = spent + left
+            windows.append(QuotaWindow(name="monthly", used_pct=round(spent / pool * 100.0, 3), used=round(spent, 6),
+                                       limit=round(pool, 6), unit="USD", resets_at=period_end))
+        elif "monthly_unavailable" not in extra:
+            extra["monthly_unavailable"] = "no monthly credit pool on this plan"
+        money = {k: v for k, v in (("monthly_credits_left", left), ("purchased_credits", _num(credits.get("purchasedCredits"))),
+                                   ("free_credits", _num(credits.get("freeCredits")))) if v is not None}
+        return QuotaReading(id=vid, name=name, source=src, source_kind="api", plan=plan, fetched_at=_now(),
+                            windows=windows, money=money, extra=extra, stale_after_s=900)
+    except Exception as e:  # noqa: BLE001
+        return _fail(vid, name, src, "api", e, key)
+
+
 async def read_ollama(client, key) -> QuotaReading:
     vid, name, src = "ollama_cloud", "Ollama Cloud", "ollama.com usage API"
     note = ("Since 2026-10-17 Ollama's usage API reports request counts only; plan limits are not "
@@ -420,6 +482,7 @@ SERVER_READERS = {
     "nanogpt": (read_nanogpt, "NANOGPT_API_KEY", 300),
     "pgsgrove": (read_pgsgrove, "PGSGROVE_API_KEY", 300),
     "synthetic": (read_synthetic, "SYNTHETIC_API_KEY", 300),
+    "commandcode": (read_commandcode, "COMMANDCODE_API_KEY", 300),
     # 300 s: the proxies drop a reading without a reset time 15 min after this read (2026-10-19:
     # they stopped polling Ollama themselves and take this reading through Switchboard).
     "ollama_cloud": (read_ollama, "OLLAMA_CLOUD_API_KEY", 300),

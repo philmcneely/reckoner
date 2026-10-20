@@ -140,6 +140,7 @@ Switchboard polls `GET /api/quota` and hands each proxy only the vendors in its 
 | NanoGPT | vendor API | `nano-gpt.com/api/subscription/v1/usage` (`NANOGPT_API_KEY`) — the source opencode's quota sidebar uses |
 | pgsgrove | vendor API | `api.pgsgrove.com/v1/usage` (`PGSGROVE_API_KEY`) |
 | Synthetic | vendor API | `api.synthetic.new/v2/quotas` (`SYNTHETIC_API_KEY`) — 5-hour requests, weekly credits (regenerating), request counters; reading it does not count against the limits |
+| Command Code | vendor API | `api.commandcode.ai/alpha/billing/credits`, `/alpha/billing/subscriptions`, `/alpha/usage/summary` (`COMMANDCODE_API_KEY`, the account key the CLI stores when you log in) — the three calls its `/usage` makes: 5-hour and weekly dollar caps, monthly credit pool |
 | Ollama Cloud | vendor API | `ollama.com/api/usage` (`OLLAMA_CLOUD_API_KEY`) — request counts only |
 | Mistral (education key) | our logs + console | one monthly dollar window against `MISTRAL_MONTHLY_USD` (default 15, resets on the 1st; pay-as-you-go is off, so it is a hard stop): the larger of our proxies' calls at list price (Switchboard `/api/backend-usage`, `cost_usd` since the 1st) and the latest admin-console figure for this month (below) |
 | Gemini API | our logs | Google publishes no per-key usage; Switchboard's `/api/backend-usage` (7-day calls and tokens) |
