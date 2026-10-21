@@ -341,6 +341,7 @@ OLLAMA_SESSION_HOURS = 5
 OLLAMA_SESSION_CAP_DEFAULTS = {"pro": 600.0}   # lowest completed-request count seen before a Pro 5-hour 429 (2026-10-20)
 OLLAMA_LIMITED_WITHIN_S = 600                  # a 429 this recent, with no success after it, means "limited now"
 OLLAMA_COUNT_ONLY_MAX_PCT = 90.0               # below the proxies' skip threshold (98): estimates defer, 429s skip
+OLLAMA_HINT_MAX_PIN_S = 3600                   # a hint-driven pin lasts at most this long from the 429 (telemetry is unauthenticated: a hint can be forged)
 OLLAMA_REPROBE_S = 600                         # a limited window's reset time: when to look again, not a promise
 _OLLAMA_CALL_URL = "https://ollama.com"
 
@@ -430,6 +431,14 @@ def parse_limit_reset(hint, anchor) -> Optional[datetime]:
         return None
 
 
+def _hinted_pin_end(hint, anchor) -> Optional[datetime]:
+    """parse_limit_reset, held to OLLAMA_HINT_MAX_PIN_S after the 429. Telemetry ingest is not yet authenticated
+    (SWITCHBOARD_INGEST_ENFORCE off), so anyone on the LAN could forge a 429 whose hint claims a 5-hour reset;
+    a longer real limit just costs one probe per hour."""
+    got = parse_limit_reset(hint, anchor)
+    return min(got, anchor + timedelta(seconds=OLLAMA_HINT_MAX_PIN_S)) if got else None
+
+
 async def _ollama_limit_events(client, now) -> Optional[dict]:
     """Are our proxies being refused right now? Switchboard's feed of recent HTTP 429s on ollama :cloud
     models. None when it cannot be asked (not configured, older Switchboard, down): then nothing is said."""
@@ -460,10 +469,10 @@ async def _ollama_limit_events(client, now) -> Optional[dict]:
     if new_429:   # first sight of a 429 newer than any remembered (limited or not: a hint outlives the feed's own verdict)
         _LIMIT_SEEN.update(last_429=key, first_seen=now, hint_until=None)
         age = _count(ev.get("last_429_age_s"))
-        _LIMIT_SEEN["hint_until"] = parse_limit_reset(ev.get("last_429_hint"), now - timedelta(seconds=age) if age is not None else now)
+        _LIMIT_SEEN["hint_until"] = _hinted_pin_end(ev.get("last_429_hint"), now - timedelta(seconds=age) if age is not None else now)
     elif key and key == _LIMIT_SEEN["last_429"] and _LIMIT_SEEN["hint_until"] is None and ev.get("last_429_hint"):
         age = _count(ev.get("last_429_age_s"))   # the hint reached Switchboard after the 429 did: pick it up late
-        _LIMIT_SEEN["hint_until"] = parse_limit_reset(ev.get("last_429_hint"), now - timedelta(seconds=age) if age is not None else now)
+        _LIMIT_SEEN["hint_until"] = _hinted_pin_end(ev.get("last_429_hint"), now - timedelta(seconds=age) if age is not None else now)
     hint_until = _LIMIT_SEEN["hint_until"]
     pin_until, from_hint = None, False
     if hint_until is not None:

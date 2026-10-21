@@ -896,8 +896,8 @@ def test_ollama_pin_uses_the_hinted_reset(monkeypatch):
     c, _ = ollama_client(limit_events=_limited_feed("retry-after=7200; You reached your Pro 5-hour limit.", age=120))
     r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
     s = _win(r, "session")
-    # 7200 s after the 429, which was 120 s ago: 118 min from now, not the 10-minute re-probe
-    assert s.used_pct == 100.0 and s.resets_at == OLLAMA_NOW + timedelta(seconds=7200 - 120)
+    # the hint says 7200 s after the 429 (120 s ago) but hint pins are held to 1 h: 58 min from now, not the 10-minute re-probe
+    assert s.used_pct == 100.0 and s.resets_at == OLLAMA_NOW + timedelta(seconds=3600 - 120)
     assert r.extra["limited_reset_estimated"] is False and r.extra["limited_reset_source"] == "limit_hint"
 
 
@@ -911,9 +911,9 @@ def test_ollama_hinted_pin_survives_quiet_feed_until_the_reset(monkeypatch):
         c, _ = ollama_client(limit_events=f)
         return run(readers.read_ollama(c, "k", now=OLLAMA_NOW + timedelta(minutes=minutes)))
     assert at(0).extra["limited"] is True
-    mid = at(60, ref="2026-10-21T01:00:00")
+    mid = at(50, ref="2026-10-21T01:00:00")
     assert mid.extra["limited"] is True and _win(mid, "session").used_pct == 100.0
-    done = at(121, ref="2026-10-21T02:01:00")          # reset (429 + 7200 s) has passed
+    done = at(60, ref="2026-10-21T02:01:00")          # the 1 h cap on hint pins (429 was 60 s before the first read) has passed
     assert done.extra["limited"] is False and _win(done, "session").used_pct == 90.0
 
 
@@ -950,3 +950,19 @@ def test_ollama_hint_that_arrives_after_the_429_is_picked_up(monkeypatch):
     c, _ = ollama_client(limit_events=_limited_feed("retry-after=3600; limit", age=420))
     r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW + timedelta(minutes=5)))
     assert _win(r, "session").resets_at == OLLAMA_NOW + timedelta(minutes=5) + timedelta(seconds=3600 - 420)
+
+
+def test_ollama_hint_pin_is_capped_at_one_hour_whatever_the_hint_claims(monkeypatch):
+    """A forged 429 row with retry-after=18000 (5 h) must not hold Ollama Cloud off for more than an hour."""
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    c, _ = ollama_client(limit_events=_limited_feed("retry-after=18000; resets in 5 hours", age=0))
+    r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
+    assert _win(r, "session").resets_at == OLLAMA_NOW + timedelta(hours=1)
+    c, _ = ollama_client(limit_events=_limited_feed("retry-after=18000; resets in 5 hours", age=0))
+    assert run(readers.read_ollama(c, "k", now=OLLAMA_NOW + timedelta(minutes=61))).extra["limited"] is False
+
+
+def test_ollama_hint_shorter_than_the_cap_is_honoured_exactly(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    c, _ = ollama_client(limit_events=_limited_feed("retry-after=900; limit", age=0))
+    assert _win(run(readers.read_ollama(c, "k", now=OLLAMA_NOW)), "session").resets_at == OLLAMA_NOW + timedelta(minutes=15)
