@@ -27,9 +27,10 @@ Verified 2026-10-18 against the live APIs:
               /usage runs). Read live 2026-10-20: credits.{monthlyCredits (left), purchasedCredits, freeCredits},
               windowLimits.{fiveHour,weekly}.{used,cap (USD),exceeded,resetAt (ms; 0 = window not started)},
               subscription planId + currentPeriodEnd, summary.totalMonthlyCredits (spent this billing period).
-  Ollama      GET https://ollama.com/api/usage                            (Bearer usage key) — since
-              2026-10-17 it answers request counts only ({range, totals.request_count, buckets});
-              the plan limits are no longer published.
+  Ollama      GET https://ollama.com/api/usage?range=24h|7d (Bearer usage key) — since 2026-10-17 request
+              counts only ({range, granularity hour|day, totals.request_count, buckets[]}); POST /api/me gives
+              the plan. Caps are not published: session/weekly windows are counts against configured caps, and
+              Switchboard's /api/backend-limit-events (our proxies' 429s) pins the session at 100% (see read_ollama).
 Google publishes no per-key usage for an AI Studio key, so the Gemini API reading is our own proxies'
 calls from Switchboard GET /api/backend-usage, labelled source_kind="our_logs".
 Mistral's education key has a $15/month allowance (pay-as-you-go off: a hard stop) and no usage API. Its
@@ -41,7 +42,7 @@ human records as vendor `mistral_console` through /api/quota/ingest (see README)
 import math
 import os
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -326,26 +327,163 @@ async def read_commandcode(client, key) -> QuotaReading:
         return _fail(vid, name, src, "api", e, key)
 
 
-async def read_ollama(client, key) -> QuotaReading:
-    vid, name, src = "ollama_cloud", "Ollama Cloud", "ollama.com usage API"
-    note = ("Since 2026-10-17 Ollama's usage API reports request counts only; plan limits are not "
-            "published. The free models (gpt-oss, gemma4, minimax-m3, nemotron) are unmetered.")
+# Ollama Cloud (read live 2026-10-21). GET /api/usage answers request counts only: ?range=24h gives hourly
+# buckets, ?range=7d daily ones (anything else is a 400 "range must be 24h, 7d, or 30d"). Only completed
+# requests are counted: the 429s of a capped window are not. POST /api/me names the plan ("Plan": "pro").
+# No endpoint publishes the caps (api/account, limits, plan, billing, subscription, quota: all 404), and
+# the cap is not a pure request count: the Pro 5-hour limit hit after ~590 completed requests on one
+# window and after ~850 on another (heavier calls cost more). So the percentage is an estimate against
+# a configured request cap, and the exact signal is the proxies' own 429s ("You reached your Pro 5-hour
+# limit"), read from Switchboard's limit-events feed, which pins the session window at 100%.
+OLLAMA_SESSION_HOURS = 5
+OLLAMA_SESSION_CAP_DEFAULTS = {"pro": 600.0}   # lowest completed-request count seen before a Pro 5-hour 429 (2026-10-20)
+OLLAMA_LIMITED_WITHIN_S = 600                  # a 429 this recent, with no success after it, means "limited now"
+OLLAMA_REPROBE_S = 600                         # a limited window's reset time: when to look again, not a promise
+_OLLAMA_CALL_URL = "https://ollama.com"
+
+
+def _env_cap(name) -> Optional[float]:
     try:
-        d = await _get_json(client, "https://ollama.com/api/usage", {"Authorization": f"Bearer {key}"})
-        totals = d.get("totals") if isinstance(d, dict) else None
-        extra = {"range": d.get("range") if isinstance(d, dict) else None,
-                 "request_count_week": (totals or {}).get("request_count")}
-        limits = d.get("limits") if isinstance(d, dict) else None
-        windows = []
-        if isinstance(limits, dict):  # the pre-2026-10-17 shape, should it come back
-            for k in ("session", "weekly"):
-                frac = _num((limits.get(k) or {}).get("usage"))
-                if frac is not None:
-                    windows.append(QuotaWindow(name=k, used_pct=round(frac * 100.0, 2)))
-        return QuotaReading(id=vid, name=name, source=src, source_kind="api", fetched_at=_now(), windows=windows,
-                            extra=extra, notes=note, stale_after_s=3600)
+        v = float(os.environ.get(name, "").strip())
+    except ValueError:
+        return None
+    return v if math.isfinite(v) and v > 0 else None
+
+
+def _count(v) -> Optional[int]:
+    n = _num(v)
+    return int(n) if n is not None and math.isfinite(n) and n >= 0 else None
+
+
+def _buckets(doc):
+    """[(from, count)] of the well-formed buckets of an Ollama usage answer."""
+    out = []
+    for b in (doc.get("buckets") if isinstance(doc, dict) else None) or []:
+        if not isinstance(b, dict):
+            continue
+        start, n = _ts(b.get("from")), _count(b.get("request_count"))
+        if start is not None and n is not None:
+            out.append((start, n))
+    return out
+
+
+def _naive(v) -> Optional[datetime]:
+    """A Switchboard row timestamp: naive, in the writing proxy's clock. Only ever compared with another one."""
+    if not isinstance(v, str) or not v:
+        return None
+    try:
+        return datetime.fromisoformat(v)
+    except ValueError:
+        return None
+
+
+async def _ollama_limit_events(client) -> Optional[dict]:
+    """Are our proxies being refused right now? Switchboard's feed of recent HTTP 429s on ollama :cloud
+    models. None when it cannot be asked (not configured, older Switchboard, down): then nothing is said."""
+    base = os.environ.get("SWITCHBOARD_URL", "").strip().rstrip("/")
+    if not base:
+        return None
+    try:
+        r = await client.get(f"{base}/api/backend-limit-events", params={"backend": "ollama", "cloud": "1"},
+                             headers={"User-Agent": UA, "Accept": "application/json"})
+        if r.status_code != 200 or len(r.content) > MAX_BYTES:
+            return None
+        ev = r.json()
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(ev, dict):
+        return None
+    ref, last429, last_ok = _naive(ev.get("ref_ts")), _naive(ev.get("last_429_ts")), _naive(ev.get("last_ok_ts"))
+    limited = bool(ref and last429 and 0 <= (ref - last429).total_seconds() <= OLLAMA_LIMITED_WITHIN_S
+                   and (last_ok is None or last_ok < last429))
+    return {"limited": limited, "last_429_age_s": int((ref - last429).total_seconds()) if ref and last429 else None,
+            "n_429": _count(ev.get("n_429"))}
+
+
+async def _ollama_plan(client, key) -> Optional[str]:
+    try:
+        r = await client.post(f"{_OLLAMA_CALL_URL}/api/me", headers={"Authorization": f"Bearer {key}", "User-Agent": UA,
+                                                                  "Accept": "application/json"})
+        if r.status_code != 200 or len(r.content) > MAX_BYTES:
+            return None
+        plan = r.json().get("Plan")
+    except Exception:  # noqa: BLE001
+        return None
+    return plan.strip().lower()[:32] if isinstance(plan, str) and plan.strip() else None
+
+
+async def read_ollama(client, key, now=None) -> QuotaReading:
+    """Ollama Cloud: the 5-hour session and weekly windows, from request counts plus our proxies' 429s."""
+    vid, name, src = "ollama_cloud", "Ollama Cloud", "ollama.com usage API"
+    now = now or _now()
+    note = ("Ollama publishes request counts only and no plan caps. Session = completed requests in the last "
+            "5 hourly buckets against a configured cap (an estimate: heavier calls count more); a recent 429 "
+            "from our proxies pins it at 100%. The free models (gpt-oss, gemma4, minimax-m3, nemotron) are "
+            "unmetered.")
+    hdr = {"Authorization": f"Bearer {key}"}
+    usage_error = None
+    hourly = daily = None
+    try:
+        hourly = await _get_json(client, "https://ollama.com/api/usage?range=24h", hdr)
+        try:
+            daily = await _get_json(client, "https://ollama.com/api/usage?range=7d", hdr)
+        except Exception as e:  # noqa: BLE001 — the session window does not need the weekly answer
+            usage_error = str(e).replace(key, "***")[:120]
     except Exception as e:  # noqa: BLE001
-        return _fail(vid, name, src, "api", e, key, notes=note)
+        usage_error = str(e).replace(key, "***")[:120]
+    events = await _ollama_limit_events(client)
+    limited = None if events is None else events["limited"]
+
+    if hourly is None:
+        if not limited:   # a read failure with no proxy signal is just a failure
+            return _fail(vid, name, src, "api", usage_error or "read failed", key, notes=note)
+        win = QuotaWindow(name="session", used_pct=100.0, resets_at=now + timedelta(seconds=OLLAMA_REPROBE_S))
+        return QuotaReading(id=vid, name=name, source=src, source_kind="api", fetched_at=now, windows=[win],
+                            extra={"limited": True, "limited_source": "429 in Switchboard usage_log",
+                                   "limited_reset_estimated": True, "window_basis": "limit events only",
+                                   "usage_error": usage_error, "n_429": events["n_429"]},
+                            notes=note, stale_after_s=900)
+
+    plan = await _ollama_plan(client, key)
+    windows, extra = [], {"range": "24h+7d", "plan_endpoint": "POST /api/me", "limited": limited}
+
+    since = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=OLLAMA_SESSION_HOURS - 1)
+    sess = [(t, n) for t, n in _buckets(hourly) if t >= since]
+    used = sum(n for _, n in sess)
+    busy = [t for t, n in sess if n > 0]
+    reset = (min(busy) + timedelta(hours=OLLAMA_SESSION_HOURS)) if busy else now + timedelta(hours=OLLAMA_SESSION_HOURS)
+    cap = _env_cap("OLLAMA_SESSION_CAP_REQUESTS")
+    cap_src = "config OLLAMA_SESSION_CAP_REQUESTS"
+    if cap is None and plan in OLLAMA_SESSION_CAP_DEFAULTS:
+        cap, cap_src = OLLAMA_SESSION_CAP_DEFAULTS[plan], f"config default for the {plan} plan (observed, not published)"
+    pct = round(used / cap * 100.0, 2) if cap else None
+    if limited:
+        pct, reset = 100.0, now + timedelta(seconds=OLLAMA_REPROBE_S)
+        extra.update(limited_source="429 in Switchboard usage_log", limited_reset_estimated=True,
+                     n_429=events["n_429"])
+    windows.append(QuotaWindow(name="session", used_pct=pct, used=float(used), limit=cap, unit="requests", resets_at=reset))
+    if cap:
+        extra["session_cap_source"] = cap_src
+    extra["request_count_session"] = used
+
+    if daily is not None:
+        wk = _buckets(daily)
+        totals = daily.get("totals") if isinstance(daily, dict) else None
+        wused = _count((totals or {}).get("request_count")) if isinstance(totals, dict) else None
+        if wused is None:
+            wused = sum(n for _, n in wk)
+        wbusy = [t for t, n in wk if n > 0 and t + timedelta(days=7) > now]  # a bucket already past 7 d frees nothing
+        wcap = _env_cap("OLLAMA_WEEKLY_CAP_REQUESTS")
+        wreset = (min(wbusy) + timedelta(days=7)) if wbusy else now + timedelta(days=7)
+        windows.append(QuotaWindow(name="weekly", used_pct=round(wused / wcap * 100.0, 2) if wcap else None,
+                                   used=float(wused), limit=wcap, unit="requests", resets_at=wreset))
+        extra["request_count_week"] = wused
+        if wcap:
+            extra["weekly_cap_source"] = "config OLLAMA_WEEKLY_CAP_REQUESTS"
+    else:
+        extra["usage_error"] = usage_error
+    return QuotaReading(id=vid, name=name, source=src, source_kind="api", plan=plan, fetched_at=now, windows=windows,
+                        extra=extra, notes=note, stale_after_s=900)
 
 
 async def _our_logs(client, vid, name, backend, notes) -> QuotaReading:

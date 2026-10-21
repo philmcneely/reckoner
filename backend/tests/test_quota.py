@@ -272,7 +272,8 @@ def test_pgsgrove_reader():
 def test_ollama_new_format_and_429():
     ok = run(readers.read_ollama(client_for(lambda req: httpx.Response(200, json={
         "range": "week", "totals": {"request_count": 42}, "buckets": []})), "ok"))
-    assert ok.ok and ok.windows == [] and ok.extra["request_count_week"] == 42
+    assert ok.ok and ok.extra["request_count_week"] == 42      # totals only, no buckets: counts of 0 in the session window
+    assert [(w.name, w.used) for w in ok.windows] == [("session", 0.0), ("weekly", 42.0)]
     limited = run(readers.read_ollama(client_for(lambda req: httpx.Response(429, json={"error": "too many requests"})), "k"))
     assert not limited.ok and "429" in limited.error
 
@@ -647,3 +648,166 @@ def test_dashboard_login_token_reads_quota(api):
     hdr = {"Authorization": "Bearer " + tok}
     assert api.get("/api/quota", headers=hdr).status_code == 200
     assert api.get("/api/quota/history/zai", headers=hdr).status_code == 200
+
+
+# ── Ollama Cloud plan windows (2026-10-20) ──────────────────────────────────
+# Fixtures are the live answers of 2026-10-21T04:39Z (request counts per hour / per day, no plan
+# limits) and the 429 body proxies logged; the body is cut where the proxy log cut it.
+
+FIX = Path(__file__).resolve().parent / "fixtures"
+OLLAMA_NOW = datetime(2026, 10, 21, 4, 39, 30, tzinfo=timezone.utc)
+
+
+def _fx(name):
+    return json.loads((FIX / name).read_text())
+
+
+def ollama_client(me=None, limit_events=None, usage_status=200):
+    """Mock of ollama.com (usage 24h/7d + POST /api/me) and Switchboard's limit-events feed."""
+    seen = []
+
+    def h(req):
+        seen.append((req.method, str(req.url)))
+        u = req.url
+        if u.host == "ollama.com" and u.path == "/api/usage":
+            if usage_status != 200:
+                return httpx.Response(usage_status, json=_fx("ollama_429_5h.json"))
+            rng = u.params.get("range")
+            return httpx.Response(200, json=_fx("ollama_usage_24h.json" if rng == "24h" else "ollama_usage_7d.json"))
+        if u.host == "ollama.com" and u.path == "/api/me":
+            return httpx.Response(200, json=me if me is not None else {"Plan": "pro", "Email": "x@example.com"})
+        if u.path == "/api/backend-limit-events":
+            if limit_events is None:
+                return httpx.Response(404)
+            return httpx.Response(200, json=limit_events)
+        return httpx.Response(500)
+    return client_for(h), seen
+
+
+def _win(r, name):
+    return next(w for w in r.windows if w.name == name)
+
+
+def test_ollama_session_window_is_the_last_five_hourly_buckets(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    c, _ = ollama_client()
+    r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
+    assert r.ok and r.plan == "pro"
+    s = _win(r, "session")
+    assert s.used == 171 + 311 + 366 + 20 + 0 and s.unit == "requests"      # 21Z..04Z, hours 00Z..04Z -> 0+171+311+366+20
+    assert s.limit == 600 and s.used_pct == round(868 / 600 * 100, 2)
+    assert s.resets_at == datetime(2026, 10, 21, 6, 0, tzinfo=timezone.utc)   # first busy bucket (01Z) + 5 h
+    assert r.extra["session_cap_source"].startswith("config")
+
+
+def test_ollama_weekly_has_count_but_no_percent_without_a_cap(monkeypatch):
+    monkeypatch.delenv("OLLAMA_WEEKLY_CAP_REQUESTS", raising=False)
+    c, _ = ollama_client()
+    r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
+    w = _win(r, "weekly")
+    assert w.used == 4193 and w.used_pct is None and w.limit is None
+    assert w.resets_at == datetime(2026, 10, 24, 0, 0, tzinfo=timezone.utc)   # oldest busy day (17th) + 7 d
+
+
+def test_ollama_weekly_percent_when_the_cap_is_configured(monkeypatch):
+    monkeypatch.setenv("OLLAMA_WEEKLY_CAP_REQUESTS", "8000")
+    monkeypatch.setenv("OLLAMA_SESSION_CAP_REQUESTS", "1000")
+    c, _ = ollama_client()
+    r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
+    assert _win(r, "weekly").used_pct == round(4193 / 8000 * 100, 2)
+    assert _win(r, "session").limit == 1000 and _win(r, "session").used_pct == 86.8
+
+
+def test_ollama_unknown_plan_gets_counts_but_no_default_cap(monkeypatch):
+    monkeypatch.delenv("OLLAMA_SESSION_CAP_REQUESTS", raising=False)
+    c, _ = ollama_client(me={"Plan": "max"})
+    r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
+    assert r.plan == "max" and _win(r, "session").used_pct is None and _win(r, "session").used == 868
+
+
+def test_ollama_me_failure_does_not_fail_the_reading(monkeypatch):
+    monkeypatch.delenv("OLLAMA_SESSION_CAP_REQUESTS", raising=False)
+
+    def h(req):
+        if req.url.path == "/api/me":
+            return httpx.Response(405)
+        return httpx.Response(200, json=_fx("ollama_usage_24h.json" if req.url.params.get("range") == "24h"
+                                            else "ollama_usage_7d.json"))
+    r = run(readers.read_ollama(client_for(h), "k", now=OLLAMA_NOW))
+    assert r.ok and r.plan is None and _win(r, "session").used == 868
+
+
+def test_ollama_recent_429_means_limited_until_a_reset_estimate(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    ev = {"ref_ts": "2026-10-20T23:39:00", "last_429_ts": "2026-10-20T23:38:08.790280", "last_ok_ts": "2026-10-20T22:59:00",
+          "n_429": 41, "window_min": 30}
+    c, seen = ollama_client(limit_events=ev)
+    r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
+    s = _win(r, "session")
+    assert s.used_pct == 100.0                       # capped regardless of the request-count estimate
+    assert s.resets_at == OLLAMA_NOW + timedelta(minutes=10)   # re-probe horizon, not a promised reset
+    assert r.extra["limited"] is True and r.extra["limited_source"] == "429 in Switchboard usage_log"
+    assert r.extra["limited_reset_estimated"] is True
+    assert any("backend-limit-events" in u for _, u in seen)
+
+
+def test_ollama_429_followed_by_success_is_not_limited(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    ev = {"ref_ts": "2026-10-20T23:39:00", "last_429_ts": "2026-10-20T23:30:00", "last_ok_ts": "2026-10-20T23:35:00",
+          "n_429": 3, "window_min": 30}
+    c, _ = ollama_client(limit_events=ev)
+    r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
+    assert r.extra["limited"] is False and _win(r, "session").used_pct == round(868 / 600 * 100, 2)   # the count estimate, not pinned
+
+
+def test_ollama_old_429_is_not_limited(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    ev = {"ref_ts": "2026-10-20T23:39:00", "last_429_ts": "2026-10-20T22:00:00", "last_ok_ts": None, "n_429": 5, "window_min": 30}
+    c, _ = ollama_client(limit_events=ev)
+    assert run(readers.read_ollama(c, "k", now=OLLAMA_NOW)).extra["limited"] is False
+
+
+def test_ollama_limit_feed_missing_or_unset_is_not_an_error(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    c, _ = ollama_client(limit_events=None)            # older Switchboard: 404
+    r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
+    assert r.ok and r.extra["limited"] is None
+    monkeypatch.delenv("SWITCHBOARD_URL")
+    c, seen = ollama_client()
+    r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
+    assert r.ok and r.extra["limited"] is None and not any("limit-events" in u for _, u in seen)
+
+
+def test_ollama_usage_429_with_a_recent_proxy_429_still_reports_limited(monkeypatch):
+    """ollama.com/api/usage itself answering 429 is a read failure, but the proxies' 429s still say limited."""
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    ev = {"ref_ts": "2026-10-20T23:39:00", "last_429_ts": "2026-10-20T23:38:30", "last_ok_ts": None, "n_429": 9, "window_min": 30}
+    c, _ = ollama_client(limit_events=ev, usage_status=429)
+    r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
+    assert r.ok and "429" in r.extra["usage_error"]   # ok: the limit itself is a valid reading, and Switchboard only trusts ok ones
+    s = _win(r, "session")
+    assert s.used_pct == 100.0 and r.extra["limited"] is True and r.extra["window_basis"] == "limit events only"
+
+
+def test_ollama_usage_429_without_proxy_signal_is_a_plain_failure():
+    c, _ = ollama_client(usage_status=429)
+    r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
+    assert not r.ok and r.windows == []
+
+
+def test_ollama_garbage_buckets_do_not_crash(monkeypatch):
+    def h(req):
+        if req.url.path == "/api/me":
+            return httpx.Response(200, json={"Plan": "pro"})
+        return httpx.Response(200, json={"range": "24h", "buckets": [{"from": "x", "request_count": -5},
+                                                                    {"from": "2026-10-21T03:00:00Z", "request_count": "9"},
+                                                                    "junk", {"from": "2026-10-21T04:00:00Z", "request_count": True}]})
+    r = run(readers.read_ollama(client_for(h), "k", now=OLLAMA_NOW))
+    assert r.ok and _win(r, "session").used == 0
+
+
+def test_ollama_key_never_in_error():
+    def h(req):
+        raise httpx.ConnectError("boom secret-key-123")
+    r = run(readers.read_ollama(client_for(h), "secret-key-123", now=OLLAMA_NOW))
+    assert not r.ok and "secret-key-123" not in r.error
