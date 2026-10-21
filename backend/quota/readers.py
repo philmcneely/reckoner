@@ -383,7 +383,7 @@ def _naive(v) -> Optional[datetime]:
 _LIMIT_SEEN: dict = {"last_429": None, "first_seen": None, "hint_until": None}   # wall-clock memory of the newest 429 we were told about
 
 OLLAMA_MAX_RESET = timedelta(hours=OLLAMA_SESSION_HOURS)   # a hinted reset further out than the 5-hour window is not believed
-_RETRY_AFTER_RE = re.compile(r"retry-after=([^;\s]{1,64})", re.I)
+_RETRY_AFTER_RE = re.compile(r"retry-after=([^;]{1,64})", re.I)
 _DUR_PART_RE = re.compile(r"(\d{1,6}(?:\.\d{1,3})?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b", re.I)
 _REL_RE = re.compile(r"(?:resets?|try again|retry|available again)\s+(?:in|after)\s+((?:\d{1,6}(?:\.\d{1,3})?\s*"
                      r"(?:hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b[\s,]*(?:and\s+)?)+)", re.I)
@@ -401,9 +401,9 @@ def parse_limit_reset(hint, anchor) -> Optional[datetime]:
         got = None
         m = _RETRY_AFTER_RE.search(hint)
         if m:
-            raw = hint.split("retry-after=", 1)[1].split(";", 1)[0].strip() if "retry-after=" in hint.lower() else ""
+            raw = m.group(1).strip()
             if re.fullmatch(r"\d{1,9}", raw):
-                got = anchor + timedelta(seconds=int(raw))
+                got = anchor + timedelta(seconds=int(raw)) if int(raw) > 0 else None   # 0 says nothing: try the message
             elif raw:   # an HTTP date (it has spaces, so take it up to the ';')
                 try:
                     d = parsedate_to_datetime(raw)
@@ -426,7 +426,7 @@ def parse_limit_reset(hint, anchor) -> Optional[datetime]:
         if got is None or not (anchor < got <= anchor + OLLAMA_MAX_RESET):
             return None
         return got
-    except (OverflowError, ValueError, TypeError):
+    except (OverflowError, ValueError, TypeError, IndexError):
         return None
 
 
@@ -460,6 +460,9 @@ async def _ollama_limit_events(client, now) -> Optional[dict]:
     if new_429:   # first sight of a 429 newer than any remembered (limited or not: a hint outlives the feed's own verdict)
         _LIMIT_SEEN.update(last_429=key, first_seen=now, hint_until=None)
         age = _count(ev.get("last_429_age_s"))
+        _LIMIT_SEEN["hint_until"] = parse_limit_reset(ev.get("last_429_hint"), now - timedelta(seconds=age) if age is not None else now)
+    elif key and key == _LIMIT_SEEN["last_429"] and _LIMIT_SEEN["hint_until"] is None and ev.get("last_429_hint"):
+        age = _count(ev.get("last_429_age_s"))   # the hint reached Switchboard after the 429 did: pick it up late
         _LIMIT_SEEN["hint_until"] = parse_limit_reset(ev.get("last_429_hint"), now - timedelta(seconds=age) if age is not None else now)
     hint_until = _LIMIT_SEEN["hint_until"]
     pin_until, from_hint = None, False

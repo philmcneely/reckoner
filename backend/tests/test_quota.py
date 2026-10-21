@@ -868,6 +868,8 @@ ANCHOR = datetime(2026, 10, 21, 5, 0, tzinfo=timezone.utc)
     ("retry-after=Wed, 21 Oct 2026 07:00:00 GMT; x", 120),                              # HTTP date
     ("You reached your limit, resets at 2026-10-21T06:30:00Z", 90),                     # ISO with zone
     ("retry-after=600; resets in 2h", 10),                                              # header wins over message
+    ("Retry-After=300", 5),                                                             # any case
+    ("retry-after=0; resets in 30 minutes", 30),                                        # a zero header says nothing: the message does
 ])
 def test_limit_hint_reset_parses(hint, expected_minutes):
     got = readers.parse_limit_reset(hint, ANCHOR)
@@ -939,3 +941,12 @@ def test_ollama_older_switchboard_without_hint_fields_still_works(monkeypatch):
     ev = {"ref_ts": "2026-10-20T23:39:00", "last_429_ts": "2026-10-20T23:38:30", "last_ok_ts": None, "n_429": 9}
     c, _ = ollama_client(limit_events=ev)
     assert _win(run(readers.read_ollama(c, "k", now=OLLAMA_NOW)), "session").resets_at == OLLAMA_NOW + timedelta(minutes=10)
+
+
+def test_ollama_hint_that_arrives_after_the_429_is_picked_up(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    c, _ = ollama_client(limit_events=_limited_feed(None))
+    assert _win(run(readers.read_ollama(c, "k", now=OLLAMA_NOW)), "session").resets_at == OLLAMA_NOW + timedelta(minutes=10)
+    c, _ = ollama_client(limit_events=_limited_feed("retry-after=3600; limit", age=420))
+    r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW + timedelta(minutes=5)))
+    assert _win(r, "session").resets_at == OLLAMA_NOW + timedelta(minutes=5) + timedelta(seconds=3600 - 420)
