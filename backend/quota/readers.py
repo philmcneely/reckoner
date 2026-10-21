@@ -372,7 +372,7 @@ def _naive(v) -> Optional[datetime]:
     if not isinstance(v, str) or not v:
         return None
     try:
-        return datetime.fromisoformat(v)
+        return datetime.fromisoformat(v).replace(tzinfo=None)   # an offset must not make one side aware
     except ValueError:
         return None
 

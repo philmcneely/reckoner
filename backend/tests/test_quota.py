@@ -811,3 +811,11 @@ def test_ollama_key_never_in_error():
         raise httpx.ConnectError("boom secret-key-123")
     r = run(readers.read_ollama(client_for(h), "secret-key-123", now=OLLAMA_NOW))
     assert not r.ok and "secret-key-123" not in r.error
+
+
+def test_ollama_limit_events_mixed_timezone_forms_do_not_crash(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    ev = {"ref_ts": "2026-10-20T23:39:00Z", "last_429_ts": "2026-10-20T23:38:30", "last_ok_ts": None, "n_429": 2}
+    c, _ = ollama_client(limit_events=ev)
+    r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
+    assert r.ok and r.extra["limited"] is True
