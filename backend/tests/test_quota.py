@@ -662,6 +662,12 @@ def _fx(name):
     return json.loads((FIX / name).read_text())
 
 
+@pytest.fixture(autouse=True)
+def _reset_ollama_pin():
+    readers._LIMIT_SEEN.update(last_429=None, first_seen=None)
+    yield
+
+
 def ollama_client(me=None, limit_events=None, usage_status=200):
     """Mock of ollama.com (usage 24h/7d + POST /api/me) and Switchboard's limit-events feed."""
     seen = []
@@ -695,7 +701,7 @@ def test_ollama_session_window_is_the_last_five_hourly_buckets(monkeypatch):
     assert r.ok and r.plan == "pro"
     s = _win(r, "session")
     assert s.used == 171 + 311 + 366 + 20 + 0 and s.unit == "requests"      # 21Z..04Z, hours 00Z..04Z -> 0+171+311+366+20
-    assert s.limit == 600 and s.used_pct == round(868 / 600 * 100, 2)
+    assert s.limit == 600 and s.used_pct == 90.0       # 868/600 = 144%, held under the skip threshold: counts defer, 429s skip
     assert s.resets_at == datetime(2026, 10, 21, 6, 0, tzinfo=timezone.utc)   # first busy bucket (01Z) + 5 h
     assert r.extra["session_cap_source"].startswith("config")
 
@@ -715,7 +721,7 @@ def test_ollama_weekly_percent_when_the_cap_is_configured(monkeypatch):
     c, _ = ollama_client()
     r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
     assert _win(r, "weekly").used_pct == round(4193 / 8000 * 100, 2)
-    assert _win(r, "session").limit == 1000 and _win(r, "session").used_pct == 86.8
+    assert _win(r, "session").limit == 1000 and _win(r, "session").used_pct == 86.8   # under the 90 ceiling
 
 
 def test_ollama_unknown_plan_gets_counts_but_no_default_cap(monkeypatch):
@@ -745,7 +751,7 @@ def test_ollama_recent_429_means_limited_until_a_reset_estimate(monkeypatch):
     r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
     s = _win(r, "session")
     assert s.used_pct == 100.0                       # capped regardless of the request-count estimate
-    assert s.resets_at == OLLAMA_NOW + timedelta(minutes=10)   # re-probe horizon, not a promised reset
+    assert s.resets_at == OLLAMA_NOW + timedelta(minutes=10)   # first seen now + re-probe horizon, not a promised reset
     assert r.extra["limited"] is True and r.extra["limited_source"] == "429 in Switchboard usage_log"
     assert r.extra["limited_reset_estimated"] is True
     assert any("backend-limit-events" in u for _, u in seen)
@@ -757,7 +763,7 @@ def test_ollama_429_followed_by_success_is_not_limited(monkeypatch):
           "n_429": 3, "window_min": 30}
     c, _ = ollama_client(limit_events=ev)
     r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
-    assert r.extra["limited"] is False and _win(r, "session").used_pct == round(868 / 600 * 100, 2)   # the count estimate, not pinned
+    assert r.extra["limited"] is False and _win(r, "session").used_pct == 90.0   # the count estimate, held under the skip threshold, not pinned
 
 
 def test_ollama_old_429_is_not_limited(monkeypatch):
@@ -819,3 +825,30 @@ def test_ollama_limit_events_mixed_timezone_forms_do_not_crash(monkeypatch):
     c, _ = ollama_client(limit_events=ev)
     r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
     assert r.ok and r.extra["limited"] is True
+
+
+def test_ollama_pin_lapses_by_wall_clock_with_no_new_traffic(monkeypatch):
+    """Capped proxies skip the vendor and log nothing, so Switchboard's ref_ts stands still: the pin must still end."""
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    ev = {"ref_ts": "2026-10-20T23:39:00", "last_429_ts": "2026-10-20T23:38:30", "last_ok_ts": None, "n_429": 9}
+    def at(minutes):
+        c, _ = ollama_client(limit_events=ev)      # the SAME feed every time: no traffic since
+        return run(readers.read_ollama(c, "k", now=OLLAMA_NOW + timedelta(minutes=minutes)))
+    first = at(0)
+    assert _win(first, "session").used_pct == 100.0 and _win(first, "session").resets_at == OLLAMA_NOW + timedelta(minutes=10)
+    mid = at(5)
+    assert _win(mid, "session").used_pct == 100.0 and _win(mid, "session").resets_at == OLLAMA_NOW + timedelta(minutes=10)  # not renewed
+    late = at(10)
+    assert late.extra["limited"] is False and _win(late, "session").used_pct == 90.0   # lapsed; counts only defer
+    assert at(15).extra["limited"] is False                                            # and stays lapsed
+
+
+def test_ollama_a_newer_429_renews_the_pin(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    def at(minutes, last429):
+        ev = {"ref_ts": "2026-10-20T23:59:00", "last_429_ts": last429, "last_ok_ts": None, "n_429": 9}
+        c, _ = ollama_client(limit_events=ev)
+        return run(readers.read_ollama(c, "k", now=OLLAMA_NOW + timedelta(minutes=minutes)))
+    at(0, "2026-10-20T23:58:00")
+    r = at(8, "2026-10-20T23:58:45")          # the probe after the lapse was refused again
+    assert r.extra["limited"] is True and _win(r, "session").resets_at == OLLAMA_NOW + timedelta(minutes=18)

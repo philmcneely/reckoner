@@ -338,6 +338,7 @@ async def read_commandcode(client, key) -> QuotaReading:
 OLLAMA_SESSION_HOURS = 5
 OLLAMA_SESSION_CAP_DEFAULTS = {"pro": 600.0}   # lowest completed-request count seen before a Pro 5-hour 429 (2026-10-20)
 OLLAMA_LIMITED_WITHIN_S = 600                  # a 429 this recent, with no success after it, means "limited now"
+OLLAMA_COUNT_ONLY_MAX_PCT = 90.0               # below the proxies' skip threshold (98): estimates defer, 429s skip
 OLLAMA_REPROBE_S = 600                         # a limited window's reset time: when to look again, not a promise
 _OLLAMA_CALL_URL = "https://ollama.com"
 
@@ -377,7 +378,10 @@ def _naive(v) -> Optional[datetime]:
         return None
 
 
-async def _ollama_limit_events(client) -> Optional[dict]:
+_LIMIT_SEEN: dict = {"last_429": None, "first_seen": None}   # wall-clock memory of the newest 429 we were told about
+
+
+async def _ollama_limit_events(client, now) -> Optional[dict]:
     """Are our proxies being refused right now? Switchboard's feed of recent HTTP 429s on ollama :cloud
     models. None when it cannot be asked (not configured, older Switchboard, down): then nothing is said."""
     base = os.environ.get("SWITCHBOARD_URL", "").strip().rstrip("/")
@@ -396,7 +400,18 @@ async def _ollama_limit_events(client) -> Optional[dict]:
     ref, last429, last_ok = _naive(ev.get("ref_ts")), _naive(ev.get("last_429_ts")), _naive(ev.get("last_ok_ts"))
     limited = bool(ref and last429 and 0 <= (ref - last429).total_seconds() <= OLLAMA_LIMITED_WITHIN_S
                    and (last_ok is None or last_ok < last429))
-    return {"limited": limited, "last_429_age_s": int((ref - last429).total_seconds()) if ref and last429 else None,
+    # The pin must end by OUR clock: Switchboard's "now" (ref_ts) only advances when proxies log rows, and
+    # proxies that skip a capped vendor log nothing, so a pin judged on ref alone would never lapse. It lasts
+    # OLLAMA_REPROBE_S from when a 429 newer than any we had seen first reached us; a fresh 429 renews it.
+    pin_until = None
+    if limited:
+        key = ev.get("last_429_ts")
+        if _LIMIT_SEEN["last_429"] != key or _LIMIT_SEEN["first_seen"] is None:
+            _LIMIT_SEEN.update(last_429=key, first_seen=now)
+        pin_until = _LIMIT_SEEN["first_seen"] + timedelta(seconds=OLLAMA_REPROBE_S)
+        limited = now < pin_until
+    return {"limited": limited, "pin_until": pin_until if limited else None,
+            "last_429_age_s": int((ref - last429).total_seconds()) if ref and last429 else None,
             "n_429": _count(ev.get("n_429"))}
 
 
@@ -431,13 +446,13 @@ async def read_ollama(client, key, now=None) -> QuotaReading:
             usage_error = str(e).replace(key, "***")[:120]
     except Exception as e:  # noqa: BLE001
         usage_error = str(e).replace(key, "***")[:120]
-    events = await _ollama_limit_events(client)
+    events = await _ollama_limit_events(client, now)
     limited = None if events is None else events["limited"]
 
     if hourly is None:
         if not limited:   # a read failure with no proxy signal is just a failure
             return _fail(vid, name, src, "api", usage_error or "read failed", key, notes=note)
-        win = QuotaWindow(name="session", used_pct=100.0, resets_at=now + timedelta(seconds=OLLAMA_REPROBE_S))
+        win = QuotaWindow(name="session", used_pct=100.0, resets_at=events["pin_until"])
         return QuotaReading(id=vid, name=name, source=src, source_kind="api", fetched_at=now, windows=[win],
                             extra={"limited": True, "limited_source": "429 in Switchboard usage_log",
                                    "limited_reset_estimated": True, "window_basis": "limit events only",
@@ -457,8 +472,12 @@ async def read_ollama(client, key, now=None) -> QuotaReading:
     if cap is None and plan in OLLAMA_SESSION_CAP_DEFAULTS:
         cap, cap_src = OLLAMA_SESSION_CAP_DEFAULTS[plan], f"config default for the {plan} plan (observed, not published)"
     pct = round(used / cap * 100.0, 2) if cap else None
+    if pct is not None and not limited:
+        # The cap is an estimate (Ollama served 868 requests in a window after capping at ~590 in another), so
+        # counts alone may defer the cloud rungs but never skip them: only a real 429 pins 100%.
+        pct = min(pct, OLLAMA_COUNT_ONLY_MAX_PCT)
     if limited:
-        pct, reset = 100.0, now + timedelta(seconds=OLLAMA_REPROBE_S)
+        pct, reset = 100.0, events["pin_until"]
         extra.update(limited_source="429 in Switchboard usage_log", limited_reset_estimated=True,
                      n_429=events["n_429"])
     windows.append(QuotaWindow(name="session", used_pct=pct, used=float(used), limit=cap, unit="requests", resets_at=reset))
