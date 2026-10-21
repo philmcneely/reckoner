@@ -664,7 +664,7 @@ def _fx(name):
 
 @pytest.fixture(autouse=True)
 def _reset_ollama_pin():
-    readers._LIMIT_SEEN.update(last_429=None, first_seen=None)
+    readers._LIMIT_SEEN.update(last_429=None, first_seen=None, hint_until=None)
     yield
 
 
@@ -852,3 +852,90 @@ def test_ollama_a_newer_429_renews_the_pin(monkeypatch):
     at(0, "2026-10-20T23:58:00")
     r = at(8, "2026-10-20T23:58:45")          # the probe after the lapse was refused again
     assert r.extra["limited"] is True and _win(r, "session").resets_at == OLLAMA_NOW + timedelta(minutes=18)
+
+
+# ── limit_hint: a real reset time from the proxy's "retry-after=<v>; <message>" ─────────────────────────
+
+ANCHOR = datetime(2026, 10, 21, 5, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("hint,expected_minutes", [
+    ("retry-after=7200; You reached your Pro 5-hour limit.", 120),                     # seconds
+    ("retry-after=90", 1.5),
+    ("You reached your Pro 5-hour limit. Resets in 2h 14m.", 134),                      # message duration
+    ("You reached your Pro 5-hour limit (resets in 45 minutes)", 45),
+    ("Limit reached; try again in 3 hours", 180),
+    ("retry-after=Wed, 21 Oct 2026 07:00:00 GMT; x", 120),                              # HTTP date
+    ("You reached your limit, resets at 2026-10-21T06:30:00Z", 90),                     # ISO with zone
+    ("retry-after=600; resets in 2h", 10),                                              # header wins over message
+])
+def test_limit_hint_reset_parses(hint, expected_minutes):
+    got = readers.parse_limit_reset(hint, ANCHOR)
+    assert got is not None and abs((got - ANCHOR).total_seconds() / 60 - expected_minutes) < 0.01
+
+
+@pytest.mark.parametrize("hint", [
+    None, "", 5, "You reached your Pro 5-hour limit. Max is $100/month for $300 of usage, with no 5-hour or weekly caps",
+    "retry-after=0", "retry-after=-5", "retry-after=abc; nothing", "retry-after=99999999",           # none / absurd (> 5 h)
+    "resets at 2020-01-01T00:00:00Z", "resets in 400 hours", "resets at 17:30",                      # past / too far / clock time with no zone
+    "x" * 5000, "retry-after=\x00\x01", "resets in " + "9" * 400 + " hours",
+])
+def test_limit_hint_unusable_gives_none(hint):
+    assert readers.parse_limit_reset(hint, ANCHOR) is None
+
+
+def _limited_feed(hint, age=120, ok=None):
+    return {"ref_ts": "2026-10-21T00:00:00", "last_429_ts": "2026-10-20T23:59:30", "last_ok_ts": ok, "n_429": 5,
+            "last_429_hint": hint, "last_429_age_s": age}
+
+
+def test_ollama_pin_uses_the_hinted_reset(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    c, _ = ollama_client(limit_events=_limited_feed("retry-after=7200; You reached your Pro 5-hour limit.", age=120))
+    r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
+    s = _win(r, "session")
+    # 7200 s after the 429, which was 120 s ago: 118 min from now, not the 10-minute re-probe
+    assert s.used_pct == 100.0 and s.resets_at == OLLAMA_NOW + timedelta(seconds=7200 - 120)
+    assert r.extra["limited_reset_estimated"] is False and r.extra["limited_reset_source"] == "limit_hint"
+
+
+def test_ollama_hinted_pin_survives_quiet_feed_until_the_reset(monkeypatch):
+    """Skipped vendor => no new rows; later reads see an unchanged (or newer-ref) feed and must keep the pin to the hinted reset."""
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    feed = _limited_feed("retry-after=7200; limit", age=60)
+
+    def at(minutes, ref="2026-10-21T00:00:00"):
+        f = dict(feed, ref_ts=ref)     # other traffic moved ref well past the 429: the ref-based test no longer says limited
+        c, _ = ollama_client(limit_events=f)
+        return run(readers.read_ollama(c, "k", now=OLLAMA_NOW + timedelta(minutes=minutes)))
+    assert at(0).extra["limited"] is True
+    mid = at(60, ref="2026-10-21T01:00:00")
+    assert mid.extra["limited"] is True and _win(mid, "session").used_pct == 100.0
+    done = at(121, ref="2026-10-21T02:01:00")          # reset (429 + 7200 s) has passed
+    assert done.extra["limited"] is False and _win(done, "session").used_pct == 90.0
+
+
+def test_ollama_hinted_pin_clears_on_a_later_success(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    c, _ = ollama_client(limit_events=_limited_feed("retry-after=7200; limit"))
+    assert run(readers.read_ollama(c, "k", now=OLLAMA_NOW)).extra["limited"] is True
+    c, _ = ollama_client(limit_events=_limited_feed("retry-after=7200; limit", ok="2026-10-21T00:00:30"))
+    r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW + timedelta(minutes=5)))
+    assert r.extra["limited"] is False                  # Ollama served a request after the 429
+
+
+def test_ollama_no_or_bad_hint_falls_back_to_the_reprobe(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    for hint in (None, "garbage", "retry-after=99999999"):
+        readers._LIMIT_SEEN.update(last_429=None, first_seen=None, hint_until=None)
+        c, _ = ollama_client(limit_events=_limited_feed(hint))
+        r = run(readers.read_ollama(c, "k", now=OLLAMA_NOW))
+        assert _win(r, "session").resets_at == OLLAMA_NOW + timedelta(minutes=10), hint
+        assert r.extra["limited_reset_estimated"] is True
+
+
+def test_ollama_older_switchboard_without_hint_fields_still_works(monkeypatch):
+    monkeypatch.setenv("SWITCHBOARD_URL", "http://switchboard.invalid:8800")
+    ev = {"ref_ts": "2026-10-20T23:39:00", "last_429_ts": "2026-10-20T23:38:30", "last_ok_ts": None, "n_429": 9}
+    c, _ = ollama_client(limit_events=ev)
+    assert _win(run(readers.read_ollama(c, "k", now=OLLAMA_NOW)), "session").resets_at == OLLAMA_NOW + timedelta(minutes=10)

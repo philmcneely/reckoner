@@ -41,6 +41,8 @@ human records as vendor `mistral_console` through /api/quota/ingest (see README)
 
 import math
 import os
+import re
+from email.utils import parsedate_to_datetime
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -378,7 +380,54 @@ def _naive(v) -> Optional[datetime]:
         return None
 
 
-_LIMIT_SEEN: dict = {"last_429": None, "first_seen": None}   # wall-clock memory of the newest 429 we were told about
+_LIMIT_SEEN: dict = {"last_429": None, "first_seen": None, "hint_until": None}   # wall-clock memory of the newest 429 we were told about
+
+OLLAMA_MAX_RESET = timedelta(hours=OLLAMA_SESSION_HOURS)   # a hinted reset further out than the 5-hour window is not believed
+_RETRY_AFTER_RE = re.compile(r"retry-after=([^;\s]{1,64})", re.I)
+_DUR_PART_RE = re.compile(r"(\d{1,6}(?:\.\d{1,3})?)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b", re.I)
+_REL_RE = re.compile(r"(?:resets?|try again|retry|available again)\s+(?:in|after)\s+((?:\d{1,6}(?:\.\d{1,3})?\s*"
+                     r"(?:hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b[\s,]*(?:and\s+)?)+)", re.I)
+_ABS_RE = re.compile(r"(?:resets?|until|at)\s+(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)", re.I)
+
+
+def parse_limit_reset(hint, anchor) -> Optional[datetime]:
+    """When a limit lifts, from a proxy's limit_hint ("retry-after=<v>; <provider message>") for a 429 issued at
+    `anchor`: Retry-After seconds or an HTTP date, else a relative ("resets in 2h 14m") or ISO ("resets at ...Z")
+    time in the message. Only a time after the anchor and within the 5-hour window is believed; a clock time
+    with no date or zone is not guessed. None when the hint says nothing usable. Never raises."""
+    try:
+        if not isinstance(hint, str) or not hint or len(hint) > 600:
+            return None
+        got = None
+        m = _RETRY_AFTER_RE.search(hint)
+        if m:
+            raw = hint.split("retry-after=", 1)[1].split(";", 1)[0].strip() if "retry-after=" in hint.lower() else ""
+            if re.fullmatch(r"\d{1,9}", raw):
+                got = anchor + timedelta(seconds=int(raw))
+            elif raw:   # an HTTP date (it has spaces, so take it up to the ';')
+                try:
+                    d = parsedate_to_datetime(raw)
+                    got = d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+                except (TypeError, ValueError, IndexError):
+                    got = None
+        if got is None:
+            m = _REL_RE.search(hint)
+            if m:
+                secs = 0.0
+                for num, unit in _DUR_PART_RE.findall(m.group(1)):
+                    secs += float(num) * (3600 if unit[0] in "hH" else 60 if unit[0] in "mM" else 1)
+                if secs > 0:
+                    got = anchor + timedelta(seconds=secs)
+        if got is None:
+            m = _ABS_RE.search(hint)
+            if m:
+                d = _ts(m.group(1).replace(" ", "T"))
+                got = d
+        if got is None or not (anchor < got <= anchor + OLLAMA_MAX_RESET):
+            return None
+        return got
+    except (OverflowError, ValueError, TypeError):
+        return None
 
 
 async def _ollama_limit_events(client, now) -> Optional[dict]:
@@ -403,14 +452,29 @@ async def _ollama_limit_events(client, now) -> Optional[dict]:
     # The pin must end by OUR clock: Switchboard's "now" (ref_ts) only advances when proxies log rows, and
     # proxies that skip a capped vendor log nothing, so a pin judged on ref alone would never lapse. It lasts
     # OLLAMA_REPROBE_S from when a 429 newer than any we had seen first reached us; a fresh 429 renews it.
-    pin_until = None
-    if limited:
-        key = ev.get("last_429_ts")
-        if _LIMIT_SEEN["last_429"] != key or _LIMIT_SEEN["first_seen"] is None:
-            _LIMIT_SEEN.update(last_429=key, first_seen=now)
+    # When that 429 carries a limit_hint with a believable reset, the pin lasts to that reset instead (kept
+    # in _LIMIT_SEEN, since later reads may see a feed that no longer says "limited"), and ends early only
+    # if Ollama served a request after the 429.
+    key = ev.get("last_429_ts") if isinstance(ev.get("last_429_ts"), str) else None
+    new_429 = key is not None and (_LIMIT_SEEN["last_429"] != key or _LIMIT_SEEN["first_seen"] is None)
+    if new_429:   # first sight of a 429 newer than any remembered (limited or not: a hint outlives the feed's own verdict)
+        _LIMIT_SEEN.update(last_429=key, first_seen=now, hint_until=None)
+        age = _count(ev.get("last_429_age_s"))
+        _LIMIT_SEEN["hint_until"] = parse_limit_reset(ev.get("last_429_hint"), now - timedelta(seconds=age) if age is not None else now)
+    hint_until = _LIMIT_SEEN["hint_until"]
+    pin_until, from_hint = None, False
+    if hint_until is not None:
+        seen429 = _naive(_LIMIT_SEEN["last_429"])
+        served_since = bool(last_ok and seen429 and last_ok > seen429)
+        if now < hint_until and not served_since:
+            limited, pin_until, from_hint = True, hint_until, True
+        else:
+            _LIMIT_SEEN["hint_until"] = None
+            limited = False   # the hinted reset has passed, or Ollama served a request after the 429
+    if pin_until is None and limited:
         pin_until = _LIMIT_SEEN["first_seen"] + timedelta(seconds=OLLAMA_REPROBE_S)
         limited = now < pin_until
-    return {"limited": limited, "pin_until": pin_until if limited else None,
+    return {"limited": limited, "pin_until": pin_until if limited else None, "from_hint": from_hint and limited,
             "last_429_age_s": int((ref - last429).total_seconds()) if ref and last429 else None,
             "n_429": _count(ev.get("n_429"))}
 
@@ -455,7 +519,7 @@ async def read_ollama(client, key, now=None) -> QuotaReading:
         win = QuotaWindow(name="session", used_pct=100.0, resets_at=events["pin_until"])
         return QuotaReading(id=vid, name=name, source=src, source_kind="api", fetched_at=now, windows=[win],
                             extra={"limited": True, "limited_source": "429 in Switchboard usage_log",
-                                   "limited_reset_estimated": True, "window_basis": "limit events only",
+                                   "limited_reset_estimated": not events["from_hint"], "window_basis": "limit events only",
                                    "usage_error": usage_error, "n_429": events["n_429"]},
                             notes=note, stale_after_s=900)
 
@@ -478,8 +542,8 @@ async def read_ollama(client, key, now=None) -> QuotaReading:
         pct = min(pct, OLLAMA_COUNT_ONLY_MAX_PCT)
     if limited:
         pct, reset = 100.0, events["pin_until"]
-        extra.update(limited_source="429 in Switchboard usage_log", limited_reset_estimated=True,
-                     n_429=events["n_429"])
+        extra.update(limited_source="429 in Switchboard usage_log", limited_reset_estimated=not events["from_hint"],
+                     limited_reset_source="limit_hint" if events["from_hint"] else "re-probe horizon", n_429=events["n_429"])
     windows.append(QuotaWindow(name="session", used_pct=pct, used=float(used), limit=cap, unit="requests", resets_at=reset))
     if cap:
         extra["session_cap_source"] = cap_src
